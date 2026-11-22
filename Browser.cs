@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
@@ -50,13 +50,20 @@ namespace SafoudeApp
 
             App.Init();
 
+            Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+            Application.ThreadException += delegate (object s, System.Threading.ThreadExceptionEventArgs e) { Log.Error("UI thread exception", e.Exception); };
+            AppDomain.CurrentDomain.UnhandledException += delegate (object s, UnhandledExceptionEventArgs e) { Log.Error("Unhandled exception", e.ExceptionObject as Exception); };
+            Log.Info("=== Safoude start; args=" + args.Length + "; " + Environment.OSVersion.VersionString);
+
             string error;
             bool oldVersion, hasWebView;
             if (!ConfigCheck.Run(out oldVersion, out hasWebView, out error))
             {
+                Log.Warn("config check failed: " + error);
                 MessageBox.Show(error, App.Name, MessageBoxButtons.OK, MessageBoxIcon.Error);
                 return;
             }
+            Log.Info("config ok; version=" + App.CfgVersion + " pack=" + App.CfgPack + " old=" + oldVersion + " webview=" + hasWebView);
             App.OldVersion = oldVersion;
             App.HasWebView = hasWebView;
 
@@ -120,7 +127,35 @@ namespace SafoudeApp
         public int Blur = 0;
         public bool Clock = true;
         public bool Tiles = true;
-        public string Accent = "#38bdf8";
+        public string Accent = "#5b9dff";
+
+        // ---- максимальная кастомизация (работает с подпиской) ----
+        public string Accent2 = "";
+        public string ColBase = "";
+        public bool Smooth = true;
+        public int Radius = 100;
+        public int TabR = 6;
+        public bool Snow = false;
+        public int SnowCount = 80;
+        public string SnowColor = "";
+        public bool Aurora = false;
+        public bool Clock24 = true;
+        public string SearchBg = "";
+        public string DlBar = "";
+        public bool DlCompact = false;
+        public int CardOp = 100;
+        public string PbNewtab = "";
+        public string PbSettings = "";
+        public string PbDownloads = "";
+
+        // ---- поведение, логи и окно ----
+        public bool LogEnabled = true;
+        public bool CloseToTray = false;
+        public int WinX = 0;
+        public int WinY = 0;
+        public int WinW = 0;
+        public int WinH = 0;
+        public bool WinMax = false;
     }
 
     public class DownloadItem
@@ -137,6 +172,74 @@ namespace SafoudeApp
         public bool UserPaused;
         public bool UserCancelled;
         public bool Announced;
+        public bool DoneNotified;
+    }
+
+    // =====================================================================
+    //  Логи: %AppData%\Safoude\logs (без адресов посещённых страниц)
+    // =====================================================================
+    public static class Log
+    {
+        private static readonly object gate = new object();
+        private static string dir;
+        public static bool Enabled = true;
+        public static string Dir { get { return dir; } }
+
+        public static void Init(string dataDir)
+        {
+            try
+            {
+                dir = Path.Combine(dataDir, "logs");
+                Directory.CreateDirectory(dir);
+                Prune();
+            }
+            catch { dir = null; }
+        }
+
+        private static void Prune()
+        {
+            string[] files = Directory.GetFiles(dir, "safoude-*.log*");
+            if (files.Length <= 10) return;
+            Array.Sort(files, delegate (string a, string b) { return File.GetLastWriteTime(b).CompareTo(File.GetLastWriteTime(a)); });
+            for (int i = 10; i < files.Length; i++)
+            {
+                try { File.Delete(files[i]); } catch { }
+            }
+        }
+
+        public static void Info(string msg) { Write("INFO ", msg); }
+        public static void Warn(string msg) { Write("WARN ", msg); }
+
+        public static void Error(string msg, Exception ex)
+        {
+            if (ex == null) { Write("ERROR", msg); return; }
+            Write("ERROR", msg + ": " + ex.GetType().Name + ": " + ex.Message + Environment.NewLine + ex.StackTrace);
+        }
+
+        private static void Write(string level, string msg)
+        {
+            if (!Enabled || dir == null) return;
+            try
+            {
+                lock (gate)
+                {
+                    string f = Path.Combine(dir, "safoude-" + DateTime.Now.ToString("yyyyMMdd") + ".log");
+                    FileInfo fi = new FileInfo(f);
+                    if (fi.Exists && fi.Length > 1048576)
+                    {
+                        string old = f + ".1";
+                        try
+                        {
+                            if (File.Exists(old)) File.Delete(old);
+                            File.Move(f, old);
+                        }
+                        catch { }
+                    }
+                    File.AppendAllText(f, DateTime.Now.ToString("HH:mm:ss.fff") + " [" + level + "] " + msg + Environment.NewLine, Encoding.UTF8);
+                }
+            }
+            catch { }
+        }
     }
 
     // =====================================================================
@@ -147,7 +250,7 @@ namespace SafoudeApp
         public const string Name = "Safoude";
         public const string Host = "safoude.local";
 
-        public static string BaseDir, AssetsDir, DataDir, WebDataDir, SettingsPath, ConfigPath;
+        public static string BaseDir, AssetsDir, DataDir, WebDataDir, SettingsPath, ConfigPath, WallpaperDir;
         public static AppSettings Cfg = new AppSettings();
         public static JavaScriptSerializer Ser = new JavaScriptSerializer();
         public static bool OldVersion;
@@ -185,9 +288,39 @@ namespace SafoudeApp
             SettingsPath = Path.Combine(DataDir, "settings.json");
             try { Directory.CreateDirectory(AssetsDir); } catch { }
             try { Directory.CreateDirectory(DataDir); } catch { }
+            Log.Init(DataDir);
+            WallpaperDir = Path.Combine(DataDir, "wallpapers");
+            try { Directory.CreateDirectory(WallpaperDir); } catch { }
             LoadStrings();
             LoadSettings();
+            MigrateWallpaper();
+            Log.Enabled = Cfg.LogEnabled;
         }
+
+        // Обои хранятся в папке данных приложения (AppData), а не рядом с программой
+        private static void MigrateWallpaper()
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(Cfg.Wallpaper)) return;
+                string name = Path.GetFileName(Cfg.Wallpaper);
+                string dst = Path.Combine(WallpaperDir, name);
+                string old = Path.Combine(AssetsDir, name);
+                if (!File.Exists(dst) && File.Exists(old))
+                {
+                    File.Move(old, dst);
+                }
+                else if (File.Exists(dst) && File.Exists(old))
+                {
+                    File.Delete(old);
+                }
+                if (!File.Exists(dst)) { Cfg.Wallpaper = null; SaveSettings(); }
+            }
+            catch { }
+        }
+
+        public static bool SmoothOn { get { return !Cfg.Premium || Cfg.Smooth; } }
+        public static int TabRadius { get { return Cfg.Premium ? Math.Max(0, Math.Min(16, Cfg.TabR)) : 6; } }
 
         // ---------- переводы ----------
         private static void LoadStrings()
@@ -406,6 +539,30 @@ namespace SafoudeApp
             d["version"] = CfgVersion;
             d["pack"] = CfgPack;
             d["webview"] = HasWebView;
+            d["logs"] = Cfg.LogEnabled;
+            d["logDir"] = Log.Dir ?? "";
+            d["closeTray"] = Cfg.CloseToTray;
+
+            Dictionary<string, object> ui = new Dictionary<string, object>();
+            ui["base"] = Cfg.ColBase;
+            ui["accent"] = Cfg.Accent;
+            ui["accent2"] = Cfg.Accent2;
+            ui["smooth"] = Cfg.Smooth;
+            ui["radius"] = Cfg.Radius;
+            ui["tabr"] = Cfg.TabR;
+            ui["snow"] = Cfg.Snow;
+            ui["snowCount"] = Cfg.SnowCount;
+            ui["snowColor"] = Cfg.SnowColor;
+            ui["aurora"] = Cfg.Aurora;
+            ui["clock24"] = Cfg.Clock24;
+            ui["searchBg"] = Cfg.SearchBg;
+            ui["dlBar"] = Cfg.DlBar;
+            ui["dlCompact"] = Cfg.DlCompact;
+            ui["cardOp"] = Cfg.CardOp;
+            ui["pbNewtab"] = Cfg.PbNewtab;
+            ui["pbSettings"] = Cfg.PbSettings;
+            ui["pbDownloads"] = Cfg.PbDownloads;
+            d["ui"] = ui;
 
             List<object> dl = new List<object>();
             foreach (DownloadItem it in Downloads)
@@ -472,6 +629,22 @@ namespace SafoudeApp
                 case "settings": return PageBytes(Pages.Settings);
                 case "downloads": return PageBytes(Pages.Downloads);
                 case "subscription": return PageBytes(Pages.Subscription);
+            }
+            if (lp.StartsWith("wallpaper/"))
+            {
+                string wname = Path.GetFileName(p.Substring(10));
+                if (string.IsNullOrEmpty(wname)) return null;
+                string wfull = Path.Combine(WallpaperDir, wname);
+                try
+                {
+                    if (File.Exists(wfull))
+                    {
+                        type = MimeOf(wname);
+                        return File.ReadAllBytes(wfull);
+                    }
+                }
+                catch { }
+                return null;
             }
             if (lp.StartsWith("assets/"))
             {
@@ -604,10 +777,19 @@ namespace SafoudeApp
 
         public static void Smooth(Graphics g)
         {
-            g.SmoothingMode = SmoothingMode.AntiAlias;
-            g.PixelOffsetMode = PixelOffsetMode.HighQuality;
-            g.InterpolationMode = InterpolationMode.HighQualityBicubic;
-            g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
+            if (App.SmoothOn)
+            {
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
+            }
+            else
+            {
+                g.SmoothingMode = SmoothingMode.None;
+                g.PixelOffsetMode = PixelOffsetMode.None;
+                g.InterpolationMode = InterpolationMode.NearestNeighbor;
+            }
         }
 
         public static GraphicsPath RoundRect(RectangleF r, float rad)
@@ -627,6 +809,7 @@ namespace SafoudeApp
         {
             float d = Math.Min(rad * 2f, Math.Min(r.Width, r.Height));
             GraphicsPath p = new GraphicsPath();
+            if (d <= 0.5f) { p.AddRectangle(r); return p; }
             p.AddArc(r.X, r.Y, d, d, 180, 90);
             p.AddArc(r.Right - d, r.Y, d, d, 270, 90);
             p.AddLine(r.Right, r.Y + d / 2f, r.Right, r.Bottom);
@@ -636,23 +819,86 @@ namespace SafoudeApp
         }
     }
 
-    // Холодная палитра
+    // Холодная палитра (цвета можно менять в настройках: максимальная кастомизация)
     public static class Theme
     {
-        public static readonly Color Bg0 = Color.FromArgb(9, 14, 24);
-        public static readonly Color Bg1 = Color.FromArgb(18, 26, 41);
-        public static readonly Color Surface = Color.FromArgb(29, 40, 61);
-        public static readonly Color Hover = Color.FromArgb(44, 60, 89);
-        public static readonly Color TabHover = Color.FromArgb(14, 22, 36);
-        public static readonly Color Text = Color.FromArgb(232, 241, 255);
-        public static readonly Color Muted = Color.FromArgb(140, 160, 190);
-        public static readonly Color Disabled = Color.FromArgb(78, 92, 116);
-        public static readonly Color Accent = Color.FromArgb(56, 189, 248);
-        public static readonly Color Accent2 = Color.FromArgb(99, 102, 241);
-        public static readonly Color Danger = Color.FromArgb(240, 82, 96);
-        public static readonly Color Gold = Color.FromArgb(255, 205, 80);
-        public static readonly Color Green = Color.FromArgb(110, 220, 170);
-        public static readonly Color Line = Color.FromArgb(52, 68, 96);
+        public static Color Bg0, Bg1, Surface, Hover, TabHover, Text, Muted, Disabled, Accent, Accent2, Danger, Gold, Green, Line;
+
+        static Theme() { Apply(null); }
+
+        private static Color Lighten(Color c, double a)
+        {
+            return Color.FromArgb((int)(c.R + (255 - c.R) * a), (int)(c.G + (255 - c.G) * a), (int)(c.B + (255 - c.B) * a));
+        }
+
+        private static Color Darken(Color c, double m)
+        {
+            return Color.FromArgb((int)(c.R * m), (int)(c.G * m), (int)(c.B * m));
+        }
+
+        public static Color ParseHex(string h, Color def)
+        {
+            if (string.IsNullOrEmpty(h) || h.Length != 7 || h[0] != '#') return def;
+            try
+            {
+                return Color.FromArgb(Convert.ToInt32(h.Substring(1, 2), 16), Convert.ToInt32(h.Substring(3, 2), 16), Convert.ToInt32(h.Substring(5, 2), 16));
+            }
+            catch { return def; }
+        }
+
+        public static void Apply(AppSettings c)
+        {
+            bool custom = c != null && c.Premium;
+
+            Danger = Color.FromArgb(224, 86, 86);
+            Gold = Color.FromArgb(230, 190, 90);
+            Green = Color.FromArgb(110, 200, 150);
+            Accent = Color.FromArgb(91, 157, 255);
+            if (custom) Accent = ParseHex(c.Accent, Accent);
+            Accent2 = Accent;
+            if (custom && !string.IsNullOrEmpty(c.Accent2)) Accent2 = ParseHex(c.Accent2, Accent);
+
+            if (custom && !string.IsNullOrEmpty(c.ColBase))
+            {
+                Color b = ParseHex(c.ColBase, Color.FromArgb(18, 26, 41));
+                double lum = (0.299 * b.R + 0.587 * b.G + 0.114 * b.B) / 255.0;
+                Bg1 = b;
+                if (lum > 0.55)
+                {
+                    Bg0 = Darken(b, 0.90);
+                    Surface = Darken(b, 0.94);
+                    Hover = Darken(b, 0.82);
+                    TabHover = Darken(b, 0.95);
+                    Line = Darken(b, 0.78);
+                    Text = Color.FromArgb(18, 24, 36);
+                    Muted = Color.FromArgb(84, 98, 122);
+                    Disabled = Color.FromArgb(150, 160, 176);
+                }
+                else
+                {
+                    Bg0 = Darken(b, 0.50);
+                    Surface = Lighten(b, 0.06);
+                    Hover = Lighten(b, 0.15);
+                    TabHover = Darken(b, 0.78);
+                    Line = Lighten(b, 0.12);
+                    Text = Color.FromArgb(232, 241, 255);
+                    Muted = Color.FromArgb(140, 160, 190);
+                    Disabled = Color.FromArgb(78, 92, 116);
+                }
+            }
+            else
+            {
+                Bg0 = Color.FromArgb(13, 15, 18);
+                Bg1 = Color.FromArgb(20, 23, 28);
+                Surface = Color.FromArgb(28, 32, 39);
+                Hover = Color.FromArgb(42, 48, 58);
+                TabHover = Color.FromArgb(17, 20, 24);
+                Text = Color.FromArgb(230, 233, 238);
+                Muted = Color.FromArgb(139, 148, 161);
+                Disabled = Color.FromArgb(84, 92, 104);
+                Line = Color.FromArgb(38, 43, 51);
+            }
+        }
     }
 
     // =====================================================================
@@ -937,7 +1183,7 @@ namespace SafoudeApp
             {
                 using (SolidBrush b = new SolidBrush(down ? Color.FromArgb(72, 255, 255, 255) : Color.FromArgb(40, 255, 255, 255)))
                 {
-                    g.FillEllipse(b, 1, 1, Width - 2, Height - 2);
+                    using (GraphicsPath hp = UI.RoundRect(new RectangleF(1, 1, Width - 2, Height - 2), UI.D(4))) { g.FillPath(b, hp); }
                 }
             }
             float gs = UI.D(20);
@@ -993,6 +1239,15 @@ namespace SafoudeApp
             Controls.Add(Star);
         }
 
+        public void ApplyTheme()
+        {
+            BackColor = Theme.Bg1;
+            Box.BackColor = Theme.Surface;
+            Box.ForeColor = Theme.Text;
+            Star.Bg = Theme.Surface;
+            Invalidate();
+        }
+
         public void SetCue(string text)
         {
             cue = text ?? "";
@@ -1028,12 +1283,16 @@ namespace SafoudeApp
             g.Clear(Theme.Bg1);
             UI.Smooth(g);
             RectangleF rc = new RectangleF(0.5f, 0.5f, Width - 1f, Height - 1f);
-            using (GraphicsPath path = UI.RoundRect(rc, rc.Height / 2f))
+            using (GraphicsPath path = UI.RoundRect(rc, UI.D(4)))
             {
                 using (SolidBrush b = new SolidBrush(Theme.Surface)) { g.FillPath(b, path); }
                 if (Box.Focused)
                 {
-                    using (Pen p = new Pen(Theme.Accent, UI.F(2f))) { g.DrawPath(p, path); }
+                    using (Pen p = new Pen(Theme.Accent, UI.F(1.5f))) { g.DrawPath(p, path); }
+                }
+                else
+                {
+                    using (Pen p = new Pen(Theme.Line, 1f)) { g.DrawPath(p, path); }
                 }
             }
             float gs = UI.D(18);
@@ -1152,7 +1411,7 @@ namespace SafoudeApp
             UI.Smooth(g);
             Color tone = warn ? Theme.Gold : Theme.Accent;
             RectangleF box = new RectangleF(UI.D(10), UI.D(3), Width - UI.D(20), Height - UI.D(7));
-            using (GraphicsPath path = UI.RoundRect(box, UI.D(12)))
+            using (GraphicsPath path = UI.RoundRect(box, UI.D(4)))
             {
                 using (SolidBrush b = new SolidBrush(Color.FromArgb(38, tone))) { g.FillPath(b, path); }
                 using (Pen p = new Pen(Color.FromArgb(120, tone), 1f)) { g.DrawPath(p, path); }
@@ -1169,7 +1428,7 @@ namespace SafoudeApp
             }
             if (!rAction.IsEmpty)
             {
-                using (GraphicsPath ap = UI.RoundRect(rAction, UI.D(9)))
+                using (GraphicsPath ap = UI.RoundRect(rAction, UI.D(3)))
                 using (SolidBrush ab = new SolidBrush(hoverAction ? Color.FromArgb(110, tone) : Color.FromArgb(70, tone)))
                 {
                     g.FillPath(ab, ap);
@@ -1179,7 +1438,7 @@ namespace SafoudeApp
             }
             if (hoverClose)
             {
-                using (SolidBrush b = new SolidBrush(Color.FromArgb(50, 255, 255, 255))) { g.FillEllipse(b, rClose); }
+                using (SolidBrush b = new SolidBrush(Color.FromArgb(50, 255, 255, 255))) { g.FillRectangle(b, rClose); }
             }
             Glyph.Close(g, new RectangleF(rClose.X + UI.D(3), rClose.Y + UI.D(3), rClose.Width - UI.D(6), rClose.Height - UI.D(6)), Theme.Text);
         }
@@ -1500,7 +1759,7 @@ namespace SafoudeApp
             if (overflow)
             {
                 bool h = hoverPart == Part.List;
-                using (GraphicsPath path = UI.RoundRect(rList, UI.D(8)))
+                using (GraphicsPath path = UI.RoundRect(rList, UI.D(4)))
                 using (SolidBrush b = new SolidBrush(h ? Theme.Hover : Theme.Surface))
                 {
                     g.FillPath(b, path);
@@ -1523,7 +1782,7 @@ namespace SafoudeApp
                 bool h = hoverPart == Part.NewTab;
                 if (h)
                 {
-                    using (SolidBrush b = new SolidBrush(Theme.Hover)) { g.FillEllipse(b, rPlus); }
+                    using (SolidBrush b = new SolidBrush(Theme.Hover)) { g.FillRectangle(b, rPlus); }
                 }
                 float gs = UI.D(18);
                 Glyph.Plus(g, new RectangleF(rPlus.X + (rPlus.Width - gs) / 2f, rPlus.Y + (rPlus.Height - gs) / 2f, gs, gs),
@@ -1534,7 +1793,7 @@ namespace SafoudeApp
                 bool h = hoverPart == Part.Focus;
                 if (h)
                 {
-                    using (GraphicsPath path = UI.RoundRect(rFocus, UI.D(9)))
+                    using (GraphicsPath path = UI.RoundRect(rFocus, UI.D(4)))
                     using (SolidBrush b = new SolidBrush(Theme.Hover))
                     {
                         g.FillPath(b, path);
@@ -1611,7 +1870,7 @@ namespace SafoudeApp
 
             if (isActive)
             {
-                using (GraphicsPath path = UI.RoundTop(r, UI.D(10)))
+                using (GraphicsPath path = UI.RoundTop(r, UI.D(App.TabRadius)))
                 using (SolidBrush b = new SolidBrush(Theme.Bg1))
                 {
                     g.FillPath(b, path);
@@ -1628,7 +1887,7 @@ namespace SafoudeApp
             else if (hov)
             {
                 Rectangle hr = new Rectangle(r.X, r.Y + UI.D(2), r.Width, r.Height - UI.D(8));
-                using (GraphicsPath path = UI.RoundRect(hr, UI.D(9)))
+                using (GraphicsPath path = UI.RoundRect(hr, UI.D(Math.Max(0, App.TabRadius - 1))))
                 using (SolidBrush b = new SolidBrush(Theme.TabHover))
                 {
                     g.FillPath(b, path);
@@ -1675,7 +1934,7 @@ namespace SafoudeApp
                 Rectangle cr = CloseRect(i);
                 if (hoverIndex == i && hoverPart == Part.TabClose)
                 {
-                    using (SolidBrush b = new SolidBrush(Theme.Hover)) g.FillEllipse(b, cr);
+                    using (SolidBrush b = new SolidBrush(Theme.Hover)) g.FillRectangle(b, cr);
                 }
                 float gs = UI.D(16);
                 Glyph.Close(g, new RectangleF(cr.X + (cr.Width - gs) / 2f, cr.Y + (cr.Height - gs) / 2f, gs, gs),
@@ -1715,7 +1974,7 @@ namespace SafoudeApp
             Graphics g = e.Graphics;
             UI.Smooth(g);
             RectangleF rc = new RectangleF(UI.D(4), 1, e.Item.Width - UI.D(8), e.Item.Height - 2);
-            using (GraphicsPath path = UI.RoundRect(rc, UI.D(8)))
+            using (GraphicsPath path = UI.RoundRect(rc, UI.D(4)))
             using (SolidBrush b = new SolidBrush(Theme.Hover))
             {
                 g.FillPath(b, path);
@@ -1854,6 +2113,7 @@ namespace SafoudeApp
             }
             catch (Exception ex)
             {
+                Log.Error("WebView2 init (tab)", ex);
                 if (!closed) MessageBox.Show("WebView2: " + ex.Message, App.Name, MessageBoxButtons.OK, MessageBoxIcon.Error);
                 return;
             }
@@ -1957,6 +2217,8 @@ namespace SafoudeApp
             if (string.IsNullOrEmpty(it.Name)) it.Name = op.Uri;
             e.Handled = true; // показываем свою вкладку загрузок вместо стандартного окна
             App.Downloads.Insert(0, it);
+            Uri du;
+            Log.Info("download started: " + it.Name + " (" + (Uri.TryCreate(op.Uri, UriKind.Absolute, out du) ? du.Host : "?") + ")");
 
             op.BytesReceivedChanged += delegate
             {
@@ -1982,6 +2244,7 @@ namespace SafoudeApp
                 {
                     it.State = "progress";
                 }
+                if (it.State != "progress") Log.Info("download " + it.State + ": " + it.Name);
                 App.RaiseDownload(it);
             };
             App.RaiseDownload(it);
@@ -2123,10 +2386,14 @@ namespace SafoudeApp
         private string fallbackReason;
         private System.Windows.Forms.Timer dlTimer;
         private bool dlDirty;
+        private bool exiting;
+        private bool trayHintShown;
+        private string lastBalloon = "";
 
         public MainForm(string[] args)
         {
             startupArgs = args ?? new string[0];
+            Theme.Apply(App.Cfg);
 
             AutoScaleMode = AutoScaleMode.None;
             FormBorderStyle = FormBorderStyle.None;
@@ -2138,6 +2405,19 @@ namespace SafoudeApp
             Rectangle wa = Screen.PrimaryScreen.WorkingArea;
             ClientSize = new Size(Math.Min(UI.D(1280), wa.Width - UI.D(60)), Math.Min(UI.D(800), wa.Height - UI.D(60)));
             MinimumSize = new Size(UI.D(560), UI.D(380));
+
+            AppSettings ws = App.Cfg;
+            if (ws.WinW >= UI.D(560) && ws.WinH >= UI.D(380))
+            {
+                Rectangle wr = new Rectangle(ws.WinX, ws.WinY, ws.WinW, ws.WinH);
+                bool onScreen = false;
+                foreach (Screen sc in Screen.AllScreens) if (sc.WorkingArea.IntersectsWith(wr)) onScreen = true;
+                if (onScreen)
+                {
+                    StartPosition = FormStartPosition.Manual;
+                    Bounds = wr;
+                }
+            }
 
             LoadIcons();
             BuildUI();
@@ -2152,6 +2432,7 @@ namespace SafoudeApp
                 if (!dlDirty) return;
                 dlDirty = false;
                 PushState("downloads");
+                RefreshTrayText();
             };
             dlTimer.Start();
 
@@ -2247,6 +2528,28 @@ namespace SafoudeApp
                 SetMaxBounds();
                 WindowState = FormWindowState.Maximized;
             }
+        }
+
+        // Применить цвета из настроек к окну браузера (вкладки, панель, меню)
+        private void ApplyTheme()
+        {
+            Theme.Apply(App.Cfg);
+            BackColor = Theme.Bg0;
+            content.BackColor = Theme.Bg1;
+            toolbar.BackColor = Theme.Bg1;
+            strip.BackColor = Theme.Bg0;
+            btnBack.Bg = Theme.Bg1;
+            btnFwd.Bg = Theme.Bg1;
+            btnReload.Bg = Theme.Bg1;
+            btnMenu.Bg = Theme.Bg1;
+            pill.ApplyTheme();
+            if (trayMenu != null)
+            {
+                trayMenu.BackColor = Theme.Bg1;
+                trayMenu.ForeColor = Theme.Text;
+            }
+            strip.Relayout(false);
+            Invalidate(true);
         }
 
         // ---------- иконки ----------
@@ -2370,25 +2673,80 @@ namespace SafoudeApp
             pill.SetBounds(pl, (toolbar.Height - pill.Height) / 2, Math.Max(UI.D(120), pr - pl), pill.Height);
         }
 
-        // ---------- трей: только "скрыть окно" ----------
+        // ---------- трей ----------
         private void BuildTray()
         {
             trayMenu = NewMenu(true);
-            trayItem = Item(App.T("tray_hide"), null, ToggleHidden);
-            trayMenu.Items.Add(trayItem);
-            trayMenu.Opening += delegate { trayItem.Text = Visible ? App.T("tray_hide") : App.T("tray_show"); };
+            FillTrayMenu();
+            trayMenu.Opening += delegate { RefreshTrayText(); };
 
             tray = new NotifyIcon();
             tray.Icon = appIcon;
             tray.Text = App.Name;
             tray.ContextMenuStrip = trayMenu;
             tray.Visible = true;
-            tray.DoubleClick += delegate { ToggleHidden(); };
+            tray.MouseClick += delegate (object s, MouseEventArgs e)
+            {
+                if (e.Button == MouseButtons.Left) ToggleHidden();
+            };
+            tray.BalloonTipClicked += delegate
+            {
+                ShowFromTray();
+                if (lastBalloon == "dl") OpenInternal("downloads");
+            };
+        }
+
+        private void FillTrayMenu()
+        {
+            trayMenu.Items.Clear();
+            trayItem = Item(App.T("tray_hide"), null, ToggleHidden);
+            trayItem.Font = new Font(trayMenu.Font, FontStyle.Bold);
+            trayMenu.Items.Add(trayItem);
+            trayMenu.Items.Add(new ToolStripSeparator());
+            trayMenu.Items.Add(Item(App.T("newtab"), null, delegate { ShowFromTray(); NewHomeTab(); }));
+            trayMenu.Items.Add(Item(App.T("m_downloads"), null, delegate { ShowFromTray(); OpenInternal("downloads"); }));
+            trayMenu.Items.Add(Item(App.T("m_settings"), null, delegate { ShowFromTray(); OpenInternal("settings"); }));
+            trayMenu.Items.Add(new ToolStripSeparator());
+            trayMenu.Items.Add(Item(App.T("m_logs"), null, OpenLogsFolder));
+            trayMenu.Items.Add(new ToolStripSeparator());
+            trayMenu.Items.Add(Item(App.T("m_exit"), null, delegate { exiting = true; Close(); }));
+        }
+
+        // Подсказка у значка: имя и ход загрузок
+        private void RefreshTrayText()
+        {
+            if (tray == null) return;
+            int act = 0;
+            long rec = 0, tot = 0;
+            foreach (DownloadItem it in App.Downloads)
+            {
+                if (it.State == "progress")
+                {
+                    act++;
+                    rec += it.Received;
+                    if (it.Total > 0) tot += it.Total;
+                }
+            }
+            string t = App.Name;
+            if (act > 0) t += "  \u2193 " + act + (tot > 0 ? " \u00b7 " + (int)(rec * 100 / tot) + "%" : "");
+            if (t.Length > 60) t = t.Substring(0, 60);
+            tray.Text = t;
+            if (trayItem != null)
+                trayItem.Text = (Visible && WindowState != FormWindowState.Minimized) ? App.T("tray_hide") : App.T("tray_show");
         }
 
         private void ToggleHidden()
         {
-            if (Visible) Hide(); else ShowFromTray();
+            if (!Visible || WindowState == FormWindowState.Minimized)
+            {
+                ShowFromTray();
+                Log.Info("window shown from tray");
+            }
+            else
+            {
+                Hide();
+                Log.Info("window hidden to tray");
+            }
         }
 
         private void ShowFromTray()
@@ -2398,9 +2756,55 @@ namespace SafoudeApp
             Activate();
         }
 
+        private void OpenLogsFolder()
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(Log.Dir)) return;
+                Directory.CreateDirectory(Log.Dir);
+                System.Diagnostics.Process.Start("explorer.exe", "\"" + Log.Dir + "\"");
+            }
+            catch (Exception ex)
+            {
+                Log.Error("open logs folder", ex);
+            }
+        }
+
+        // ---------- запоминаем размер и положение окна ----------
+        private void SaveWindowState()
+        {
+            try
+            {
+                AppSettings c = App.Cfg;
+                Rectangle b;
+                bool max;
+                if (full) { b = prevBounds; max = prevMax; }
+                else if (WindowState == FormWindowState.Normal) { b = Bounds; max = false; }
+                else { b = RestoreBounds; max = WindowState == FormWindowState.Maximized; }
+                c.WinX = b.X; c.WinY = b.Y; c.WinW = b.Width; c.WinH = b.Height; c.WinMax = max;
+                App.SaveSettings();
+            }
+            catch { }
+        }
+
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
+            if (!exiting && App.Cfg.CloseToTray && e.CloseReason == CloseReason.UserClosing)
+            {
+                e.Cancel = true;
+                Hide();
+                Log.Info("window hidden to tray (close button)");
+                if (!trayHintShown && tray != null)
+                {
+                    trayHintShown = true;
+                    lastBalloon = "tray";
+                    try { tray.ShowBalloonTip(2500, App.Name, App.T("n_tray"), ToolTipIcon.Info); } catch { }
+                }
+                return;
+            }
             base.OnFormClosing(e);
+            SaveWindowState();
+            Log.Info("exit");
             if (tray != null) { tray.Visible = false; tray.Dispose(); tray = null; }
         }
 
@@ -2487,6 +2891,7 @@ namespace SafoudeApp
 
         private async Task StartAsync()
         {
+            if (App.Cfg.WinMax) { SetMaxBounds(); WindowState = FormWindowState.Maximized; }
             StartPipeServer();
 
             if (App.HasWebView)
@@ -2498,6 +2903,7 @@ namespace SafoudeApp
                 catch (Exception ex)
                 {
                     App.HasWebView = false;
+                    Log.Error("WebView2 init failed, using compatibility mode", ex);
                     fallbackReason = ex.Message;
                 }
             }
@@ -2567,6 +2973,7 @@ namespace SafoudeApp
                          raw.StartsWith("https://", StringComparison.OrdinalIgnoreCase) ||
                          raw.StartsWith("file:", StringComparison.OrdinalIgnoreCase)) url = raw;
                 if (url == null) continue;
+                Log.Info("open from outside: " + (File.Exists(raw) ? Path.GetFileName(raw) : "url"));
                 if (full) { manualFull = false; pageFull = false; ApplyFull(); }
                 AddTab(url, true);
                 any = true;
@@ -2591,6 +2998,7 @@ namespace SafoudeApp
             ActivateTab(idx);
             t.Page.Start();
             t.Page.Navigate(url);
+            Log.Info("tab opened: " + (t.Kind ?? (url != null && url.StartsWith("file:", StringComparison.OrdinalIgnoreCase) ? "file" : "web")));
             return t;
         }
 
@@ -2690,6 +3098,7 @@ namespace SafoudeApp
             content.Controls.Remove(t.Page.View);
             t.Page.Destroy();
             ActivateTab(na);
+            Log.Info("tab closed");
         }
 
         private void CycleTab(int dir)
@@ -2791,6 +3200,7 @@ namespace SafoudeApp
             b.Url = url;
             App.Cfg.Bookmarks.Add(b);
             App.SaveSettings();
+            Log.Info("bookmark added (" + App.Cfg.Bookmarks.Count + ")");
             return true;
         }
 
@@ -2803,6 +3213,7 @@ namespace SafoudeApp
             {
                 App.Cfg.Bookmarks.RemoveAt(idx);
                 App.SaveSettings();
+                Log.Info("bookmark removed");
             }
             else
             {
@@ -2864,6 +3275,8 @@ namespace SafoudeApp
                 case "buy":
                     App.Cfg.Premium = true;
                     App.SaveSettings();
+                    Log.Info("advanced customization activated");
+                    ApplyTheme();
                     t.Page.Navigate("safoude://settings#advanced");
                     PushState(null);
                     break;
@@ -2892,10 +3305,15 @@ namespace SafoudeApp
                     break;
 
                 case "clearWallpaper":
+                    Log.Info("wallpaper cleared");
                     DeleteWallpaperFile();
                     App.Cfg.Wallpaper = null;
                     App.SaveSettings();
                     PushState(null);
+                    break;
+
+                case "openLogs":
+                    OpenLogsFolder();
                     break;
 
                 case "set":
@@ -2921,10 +3339,36 @@ namespace SafoudeApp
             }
         }
 
+        // "" = сбросить цвет; null = некорректное значение
+        private static string NormHex(object v)
+        {
+            string s = Convert.ToString(v);
+            if (s == null) return null;
+            s = s.Trim().ToLowerInvariant();
+            if (s.Length == 0) return "";
+            if (!s.StartsWith("#")) s = "#" + s;
+            if (Regex.IsMatch(s, "^#[0-9a-f]{3}$")) s = "#" + s[1] + s[1] + s[2] + s[2] + s[3] + s[3];
+            return Regex.IsMatch(s, "^#[0-9a-f]{6}$") ? s : null;
+        }
+
+        private static bool SetHex(ref string target, object val)
+        {
+            string h = NormHex(val);
+            if (h == null) return false;
+            target = h;
+            return true;
+        }
+
+        private static int ClampInt(object v, int lo, int hi)
+        {
+            return Math.Max(lo, Math.Min(hi, Convert.ToInt32(v)));
+        }
+
         private void ApplySetting(string key, object val)
         {
             AppSettings c = App.Cfg;
             bool langChanged = false;
+            bool themeChanged = false;
             try
             {
                 switch (key)
@@ -2936,8 +3380,11 @@ namespace SafoudeApp
                             break;
                         }
                     case "country":
-                        c.Country = Convert.ToString(val);
-                        break;
+                        {
+                            string v = Convert.ToString(val);
+                            if (v != null && Regex.IsMatch(v, "^[A-Za-z]{2}$")) c.Country = v.ToUpperInvariant();
+                            break;
+                        }
                     case "engine":
                         {
                             string v = Convert.ToString(val);
@@ -2947,25 +3394,106 @@ namespace SafoudeApp
                     case "clock":
                         c.Clock = Convert.ToBoolean(val);
                         break;
+                    case "closeTray":
+                        c.CloseToTray = Convert.ToBoolean(val);
+                        break;
+                    case "logs":
+                        {
+                            bool on = Convert.ToBoolean(val);
+                            if (!on) Log.Info("logging disabled by user");
+                            c.LogEnabled = on;
+                            Log.Enabled = on;
+                            if (on) Log.Info("logging enabled by user");
+                            break;
+                        }
                     case "tiles":
                         c.Tiles = Convert.ToBoolean(val);
                         break;
+
+                    // ---- с подпиской (расширенная и максимальная кастомизация) ----
                     case "dim":
-                        if (c.Premium) c.Dim = Math.Max(0, Math.Min(80, Convert.ToInt32(val)));
+                        if (c.Premium) c.Dim = ClampInt(val, 0, 80);
                         break;
                     case "blur":
-                        if (c.Premium) c.Blur = Math.Max(0, Math.Min(24, Convert.ToInt32(val)));
+                        if (c.Premium) c.Blur = ClampInt(val, 0, 24);
                         break;
                     case "accent":
+                        if (c.Premium && SetHex(ref c.Accent, val))
                         {
-                            string v = Convert.ToString(val);
-                            if (c.Premium && Regex.IsMatch(v, "^#[0-9a-fA-F]{6}$")) c.Accent = v;
-                            break;
+                            if (c.Accent.Length == 0) c.Accent = "#5b9dff";
+                            themeChanged = true;
                         }
+                        break;
+                    case "accent2":
+                        if (c.Premium && SetHex(ref c.Accent2, val)) themeChanged = true;
+                        break;
+                    case "base":
+                        if (c.Premium && SetHex(ref c.ColBase, val)) themeChanged = true;
+                        break;
+                    case "smooth":
+                        if (c.Premium) { c.Smooth = Convert.ToBoolean(val); themeChanged = true; }
+                        break;
+                    case "radius":
+                        if (c.Premium) c.Radius = ClampInt(val, 50, 150);
+                        break;
+                    case "tabr":
+                        if (c.Premium) { c.TabR = ClampInt(val, 0, 16); themeChanged = true; }
+                        break;
+                    case "snow":
+                        if (c.Premium) c.Snow = Convert.ToBoolean(val);
+                        break;
+                    case "snowCount":
+                        if (c.Premium) c.SnowCount = ClampInt(val, 0, 200);
+                        break;
+                    case "snowColor":
+                        if (c.Premium) SetHex(ref c.SnowColor, val);
+                        break;
+                    case "aurora":
+                        if (c.Premium) c.Aurora = Convert.ToBoolean(val);
+                        break;
+                    case "clock24":
+                        if (c.Premium) c.Clock24 = Convert.ToBoolean(val);
+                        break;
+                    case "searchBg":
+                        if (c.Premium) SetHex(ref c.SearchBg, val);
+                        break;
+                    case "dlBar":
+                        if (c.Premium) SetHex(ref c.DlBar, val);
+                        break;
+                    case "dlCompact":
+                        if (c.Premium) c.DlCompact = Convert.ToBoolean(val);
+                        break;
+                    case "cardOp":
+                        if (c.Premium) c.CardOp = ClampInt(val, 20, 100);
+                        break;
+                    case "pbNewtab":
+                        if (c.Premium) SetHex(ref c.PbNewtab, val);
+                        break;
+                    case "pbSettings":
+                        if (c.Premium) SetHex(ref c.PbSettings, val);
+                        break;
+                    case "pbDownloads":
+                        if (c.Premium) SetHex(ref c.PbDownloads, val);
+                        break;
+                    case "resetCustom":
+                        if (c.Premium)
+                        {
+                            AppSettings d = new AppSettings();
+                            c.Accent = d.Accent; c.Accent2 = d.Accent2; c.ColBase = d.ColBase; c.Smooth = d.Smooth;
+                            c.Radius = d.Radius; c.TabR = d.TabR; c.Snow = d.Snow; c.SnowCount = d.SnowCount;
+                            c.SnowColor = d.SnowColor; c.Aurora = d.Aurora; c.Clock24 = d.Clock24; c.SearchBg = d.SearchBg;
+                            c.DlBar = d.DlBar; c.DlCompact = d.DlCompact; c.CardOp = d.CardOp;
+                            c.PbNewtab = d.PbNewtab; c.PbSettings = d.PbSettings; c.PbDownloads = d.PbDownloads;
+                            c.Dim = d.Dim; c.Blur = d.Blur;
+                            themeChanged = true;
+                        }
+                        break;
                 }
             }
             catch { return; }
             App.SaveSettings();
+            Log.Info("setting changed: " + key);
+            if (themeChanged) ApplyTheme();
             if (langChanged) RefreshLanguage();
             PushState(null);
         }
@@ -2977,7 +3505,8 @@ namespace SafoudeApp
                 if (t.Kind != null) t.Title = App.TitleFor(t.Kind);
             }
             pill.SetCue(App.T("addr_ph"));
-            if (trayItem != null) trayItem.Text = Visible ? App.T("tray_hide") : App.T("tray_show");
+            if (trayMenu != null) FillTrayMenu();
+            RefreshTrayText();
             strip.Invalidate();
             SyncChrome();
         }
@@ -2993,14 +3522,17 @@ namespace SafoudeApp
                 {
                     string ext = Path.GetExtension(ofd.FileName).ToLowerInvariant();
                     string name = "wallpaper_" + DateTime.Now.Ticks + ext;
-                    File.Copy(ofd.FileName, Path.Combine(App.AssetsDir, name), true);
+                    Directory.CreateDirectory(App.WallpaperDir);
+                    File.Copy(ofd.FileName, Path.Combine(App.WallpaperDir, name), true);
                     DeleteWallpaperFile();
                     App.Cfg.Wallpaper = name;
                     App.SaveSettings();
+                    Log.Info("wallpaper set: " + name);
                     PushState(null);
                 }
                 catch (Exception ex)
                 {
+                    Log.Error("wallpaper", ex);
                     MessageBox.Show(ex.Message, App.Name, MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 }
             }
@@ -3012,7 +3544,7 @@ namespace SafoudeApp
             {
                 if (!string.IsNullOrEmpty(App.Cfg.Wallpaper))
                 {
-                    string p = Path.Combine(App.AssetsDir, App.Cfg.Wallpaper);
+                    string p = Path.Combine(App.WallpaperDir, Path.GetFileName(App.Cfg.Wallpaper));
                     if (File.Exists(p)) File.Delete(p);
                 }
             }
@@ -3034,6 +3566,7 @@ namespace SafoudeApp
 
         private void DownloadCommand(DownloadItem it, string cmd)
         {
+            Log.Info("download command: " + cmd);
             switch (cmd)
             {
                 case "dlOpen":
@@ -3065,6 +3598,20 @@ namespace SafoudeApp
             {
                 it.Announced = true;
                 notice.ShowNotice(App.T("n_dl", it.Name), false, App.T("a_downloads"), delegate { OpenInternal("downloads"); });
+            }
+            if (it.State == "done" && !it.DoneNotified)
+            {
+                it.DoneNotified = true;
+                bool hidden = !Visible || WindowState == FormWindowState.Minimized;
+                if (hidden && tray != null)
+                {
+                    lastBalloon = "dl";
+                    try { tray.ShowBalloonTip(3000, App.Name, App.T("n_dl_done", it.Name), ToolTipIcon.Info); } catch { }
+                }
+                else
+                {
+                    notice.ShowNotice(App.T("n_dl_done", it.Name), false, App.T("a_downloads"), delegate { OpenInternal("downloads"); });
+                }
             }
         }
 
@@ -3195,7 +3742,7 @@ namespace SafoudeApp
             m.Items.Add(Item(App.T("fullscreen").Replace(" (F11)", ""), "F11", ToggleFullscreen));
             m.Items.Add(Item(App.T("m_reload"), "F5", ReloadCur));
             m.Items.Add(new ToolStripSeparator());
-            m.Items.Add(Item(App.T("m_exit"), null, delegate { Close(); }));
+            m.Items.Add(Item(App.T("m_exit"), null, delegate { exiting = true; Close(); }));
 
             m.Show(btnMenu, new Point(btnMenu.Width, btnMenu.Height + UI.D(4)), ToolStripDropDownDirection.BelowLeft);
         }
@@ -3382,138 +3929,144 @@ namespace SafoudeApp
 <link rel=""icon"" href=""assets/app-icon.ico"">
 <meta name=""viewport"" content=""width=device-width, initial-scale=1"">
 <style>
-:root{--accent:#38bdf8;--accent2:#6366f1;--bg:#050b17;--card:rgba(14,24,44,.72);--stroke:rgba(140,190,255,.17);--text:#e9f2ff;--muted:#8ea6c6;--danger:#ff5d6c;--ok:#4ade80}
+:root{--accent:#5b9dff;--accent2:#5b9dff;--bg:#0e1013;--bg2:#12151a;--panel:#15181d;--card:rgb(21,24,29);--line:#262b33;--text:#e6e9ee;--muted:#8b94a1;--danger:#e05656;--ok:#6ec896;--rs:1;--barbg:linear-gradient(90deg,var(--accent),var(--accent2))}
 *{box-sizing:border-box;margin:0;padding:0}
 html,body{height:100%}
-body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--text);user-select:none;-webkit-user-select:none}
+body{font:14px/1.5 'Segoe UI',system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--text);user-select:none;-webkit-user-select:none;-webkit-font-smoothing:antialiased}
 button,input,select{font:inherit;color:inherit}
-button{cursor:pointer}
-.btn{height:38px;padding:0 18px;border-radius:12px;border:1px solid var(--stroke);background:rgba(255,255,255,.06);transition:background .15s,transform .1s}
-.btn:hover{background:rgba(255,255,255,.14)}
-.btn:active{transform:scale(.97)}
-.btn.primary{border:0;color:#03101f;font-weight:600;background:linear-gradient(120deg,var(--accent),var(--accent2))}
-.btn.primary:hover{filter:brightness(1.1);background:linear-gradient(120deg,var(--accent),var(--accent2))}
-.btn.sm{height:32px;padding:0 12px;border-radius:10px;font-size:13px}
-.btn.danger:hover{background:var(--danger);border-color:transparent;color:#fff}
-select,input[type=text]{height:40px;border-radius:12px;border:1px solid var(--stroke);background:rgba(10,20,40,.85);padding:0 12px;outline:0;user-select:text;-webkit-user-select:text}
-select:focus,input[type=text]:focus{border-color:var(--accent)}
-option{background:#0b1426}
-.sw{display:flex;align-items:center;justify-content:space-between;gap:16px;cursor:pointer;padding:7px 0}
+button{cursor:pointer;background:none;border:0}
+:focus-visible{outline:1px solid var(--accent);outline-offset:2px}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;height:34px;padding:0 16px;border:1px solid var(--line);border-radius:calc(4px * var(--rs));background:transparent;transition:background .12s,border-color .12s}
+.btn:hover{background:rgba(255,255,255,.06);border-color:#3b424d}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#0b0d10;font-weight:600}
+.btn.primary:hover{filter:brightness(1.08);background:var(--accent)}
+.btn.sm{height:28px;padding:0 10px;font-size:12.5px}
+.btn.danger:hover{background:var(--danger);border-color:var(--danger);color:#fff}
+input[type=text]{height:34px;border:1px solid var(--line);border-radius:calc(4px * var(--rs));background:rgba(0,0,0,.28);padding:0 10px;outline:0;user-select:text;-webkit-user-select:text}
+input[type=text]:focus{border-color:var(--accent)}
+.sw{display:flex;align-items:center;cursor:pointer}
 .sw input{display:none}
-.sw .t{position:relative;flex:none;width:44px;height:24px;border-radius:12px;background:rgba(255,255,255,.18);transition:background .2s}
-.sw .t::after{content:"""";position:absolute;left:3px;top:3px;width:18px;height:18px;border-radius:50%;background:#fff;transition:transform .2s}
+.sw .t{position:relative;flex:none;width:38px;height:20px;border-radius:calc(3px * var(--rs));background:#2b313a;transition:background .15s}
+.sw .t::after{content:"""";position:absolute;left:3px;top:3px;width:14px;height:14px;border-radius:calc(2px * var(--rs));background:#cdd3dc;transition:transform .15s}
 .sw input:checked+.t{background:var(--accent)}
-.sw input:checked+.t::after{transform:translateX(20px)}
-input[type=range]{width:100%;accent-color:var(--accent);cursor:pointer}
-::-webkit-scrollbar{width:10px}
-::-webkit-scrollbar-thumb{background:rgba(150,190,255,.25);border-radius:6px}
+.sw input:checked+.t::after{transform:translateX(18px);background:#fff}
+input[type=range]{accent-color:var(--accent);cursor:pointer}
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-thumb{background:#2c323b;border:2px solid transparent;background-clip:content-box}
 ::-webkit-scrollbar-track{background:transparent}
+.nosmooth *,.nosmooth *::before,.nosmooth *::after{transition:none!important;animation:none!important}
 
-body{overflow:hidden;background:#040913}
-#bg{position:fixed;inset:-40px;background-size:cover;background-position:center;transition:filter .4s}
-#bg.def{background:radial-gradient(1100px 700px at 15% -10%,#0f3a6b 0%,transparent 62%),radial-gradient(900px 700px at 100% 0%,#1a2a78 0%,transparent 58%),linear-gradient(180deg,#040a17,#071327);overflow:hidden}
-.blob{position:absolute;border-radius:50%;filter:blur(110px);opacity:.5;display:none}
-#bg.def .blob{display:block}
-.b1{width:560px;height:560px;left:8%;top:-8%;background:#2aa7e8;animation:f1 24s ease-in-out infinite alternate}
-.b2{width:520px;height:520px;right:2%;top:12%;background:#5b6cff;animation:f2 28s ease-in-out infinite alternate}
-.b3{width:600px;height:600px;left:36%;bottom:-26%;background:#18c6b3;opacity:.28;animation:f3 32s ease-in-out infinite alternate}
-@keyframes f1{to{transform:translate(120px,90px) scale(1.15)}}
-@keyframes f2{to{transform:translate(-140px,120px) scale(.9)}}
-@keyframes f3{to{transform:translate(-160px,-60px) scale(1.1)}}
+:root{--blob1:#5b9dff;--blob2:#5b9dff}
+body{overflow:hidden}
+#bg{position:fixed;inset:-30px;background-size:cover;background-position:center;background-color:var(--bg);transition:filter .3s}
+.blob{position:absolute;border-radius:50%;filter:blur(120px);opacity:.28;display:none}
+#bg.glow .blob{display:block}
+.b1{width:540px;height:540px;left:6%;top:-10%;background:var(--blob1)}
+.b2{width:480px;height:480px;right:4%;bottom:-12%;background:var(--blob2)}
 #snow{position:fixed;inset:0;pointer-events:none}
-#shade{position:fixed;inset:0;background:#000;opacity:.3;pointer-events:none;transition:opacity .3s}
-#brand{position:fixed;left:22px;top:18px;display:flex;align-items:center;gap:10px;font-weight:600;letter-spacing:.4px;opacity:.92}
-#brand img{width:28px;height:28px;border-radius:8px;box-shadow:0 4px 18px rgba(0,0,0,.4)}
-main{position:relative;height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:0 24px 40px}
-#clockbox{text-align:center;margin-bottom:30px}
-#clock{font-size:92px;font-weight:200;letter-spacing:-2px;line-height:1;text-shadow:0 6px 40px rgba(60,160,255,.35)}
-#date{margin-top:8px;font-size:18px;opacity:.82;text-shadow:0 2px 14px rgba(0,0,0,.45)}
-#sf{width:min(680px,100%);height:60px;background:#fff;border-radius:30px;display:flex;align-items:center;padding:0 8px 0 22px;gap:12px;box-shadow:0 14px 50px rgba(0,10,30,.5),0 2px 8px rgba(0,0,0,.2);transition:box-shadow .25s,transform .25s}
-#sf:focus-within{box-shadow:0 18px 60px rgba(0,10,30,.55),0 0 0 4px rgba(56,189,248,.45);transform:translateY(-1px)}
-#sf svg.s{flex:none;width:22px;height:22px;stroke:#64748b;fill:none;stroke-width:2;stroke-linecap:round}
-#q{flex:1;min-width:0;height:100%;border:0;outline:0;background:transparent;font-size:18px;color:#16202e;padding:0;border-radius:0;user-select:text;-webkit-user-select:text}
-#q::placeholder{color:#8794a8}
-#ai{flex:none;height:46px;padding:0 20px 0 16px;border:0;border-radius:23px;display:flex;align-items:center;gap:8px;font-size:15px;font-weight:600;color:#03101f;background:linear-gradient(120deg,#38bdf8,#6366f1);box-shadow:0 6px 18px rgba(56,130,248,.45);transition:transform .15s,filter .15s,box-shadow .15s}
-#ai:hover{transform:translateY(-1px);filter:brightness(1.08);box-shadow:0 10px 24px rgba(56,130,248,.55)}
-#ai:active{transform:scale(.97)}
-#ai svg{width:18px;height:18px;fill:#03101f}
-#tiles{margin-top:46px;width:min(900px,100%);display:flex;flex-wrap:wrap;justify-content:center;gap:18px}
-.tile{position:relative;width:112px;padding:16px 10px 14px;border-radius:22px;text-decoration:none;color:#fff;text-align:center;background:rgba(160,210,255,.1);border:1px solid rgba(170,215,255,.2);backdrop-filter:blur(16px) saturate(140%);transition:transform .18s,background .18s,box-shadow .18s;animation:pop .45s both}
-.tile:hover{transform:translateY(-5px);background:rgba(170,215,255,.2);box-shadow:0 14px 34px rgba(0,10,40,.45)}
-@keyframes pop{from{opacity:0;transform:translateY(14px) scale(.96)}}
-.ico{width:52px;height:52px;margin:0 auto 10px;border-radius:50%;background:#fff;display:flex;align-items:center;justify-content:center;overflow:hidden;box-shadow:0 4px 14px rgba(0,10,40,.35)}
-.ico img{width:30px;height:30px;object-fit:contain}
-.ico b{font-size:22px;color:#33415a}
-.ttl{font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;text-shadow:0 1px 8px rgba(0,0,0,.5)}
-.del{position:absolute;right:6px;top:6px;width:22px;height:22px;border:0;border-radius:50%;background:rgba(0,10,30,.55);color:#fff;font-size:14px;line-height:22px;opacity:0;transition:opacity .15s,background .15s}
+#shade{position:fixed;inset:0;background:#000;opacity:0;pointer-events:none}
+#top{position:fixed;left:0;right:0;top:0;height:52px;display:flex;align-items:center;padding:0 24px;border-bottom:1px solid var(--line);background:rgba(0,0,0,.18)}
+.brand{display:flex;align-items:center;gap:10px;font-weight:600}
+.brand img{width:20px;height:20px}
+main{position:relative;height:100%;display:flex;align-items:center;justify-content:center;padding:52px 24px 0}
+#box{width:min(760px,100%);margin-top:-6vh}
+#clock{font-size:56px;font-weight:300;line-height:1;font-variant-numeric:tabular-nums;letter-spacing:-1px}
+#date{margin:8px 0 26px;color:var(--muted)}
+#sf{display:flex;align-items:center;height:48px;border-radius:calc(4px * var(--rs));background:var(--search,#fff);padding:0 6px 0 16px;gap:12px;border:1px solid transparent;transition:border-color .12s}
+#sf:focus-within{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent)}
+#sf svg.s{flex:none;width:18px;height:18px;stroke:#667085;fill:none;stroke-width:2;stroke-linecap:round}
+#q{flex:1;min-width:0;height:100%;border:0;outline:0;background:transparent;font-size:16px;color:var(--search-fg,#15191f);padding:0;border-radius:0;user-select:text;-webkit-user-select:text}
+#q::placeholder{color:#8a93a3}
+#ai{flex:none;height:36px;padding:0 14px;border-radius:calc(3px * var(--rs));display:flex;align-items:center;gap:8px;background:var(--accent);color:#0b0d10;font-weight:600;font-size:13.5px}
+#ai:hover{filter:brightness(1.08)}
+#ai svg{width:15px;height:15px;fill:#0b0d10}
+.bmh{display:flex;justify-content:space-between;align-items:baseline;margin:34px 0 10px;padding-bottom:8px;border-bottom:1px solid var(--line);color:var(--muted);font-size:13px}
+#tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(176px,1fr));gap:8px}
+.tile{position:relative;display:flex;align-items:center;gap:12px;height:52px;padding:0 12px;border:1px solid var(--line);border-radius:calc(4px * var(--rs));color:var(--text);text-decoration:none;background:rgba(0,0,0,.2);transition:background .12s,border-color .12s}
+.tile:hover{background:rgba(255,255,255,.05);border-color:#3b424d}
+.fav{flex:none;width:28px;height:28px;border-radius:calc(3px * var(--rs));background:#fff;display:flex;align-items:center;justify-content:center;overflow:hidden}
+.fav img{width:18px;height:18px;object-fit:contain}
+.fav b{font-size:13px;color:#33415a}
+.tt{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:13.5px}
+.del{flex:none;width:22px;height:22px;border-radius:calc(3px * var(--rs));color:var(--muted);font-size:15px;line-height:20px;opacity:0}
 .tile:hover .del{opacity:1}
-.del:hover{background:var(--danger)}
-.tile.add{background:transparent;border:1.5px dashed rgba(190,225,255,.5);cursor:pointer}
-.tile.add .ico{background:rgba(190,225,255,.14);box-shadow:none}
-.tile.add .ico b{color:#fff;font-size:30px;font-weight:300}
-.tile.add:hover{background:rgba(190,225,255,.12)}
-#count{margin-top:16px;font-size:12px;opacity:.6;letter-spacing:.4px}
-#gear{position:fixed;right:22px;bottom:22px;width:46px;height:46px;border-radius:50%;border:1px solid rgba(170,215,255,.25);background:rgba(160,210,255,.12);display:flex;align-items:center;justify-content:center;backdrop-filter:blur(16px);transition:transform .25s,background .2s}
-#gear:hover{background:rgba(170,215,255,.25);transform:rotate(60deg)}
-#gear svg{width:22px;height:22px;fill:none;stroke:#fff;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
-#panel{position:fixed;right:22px;bottom:80px;width:310px;padding:20px;border-radius:22px;background:rgba(8,18,38,.82);border:1px solid rgba(160,210,255,.16);backdrop-filter:blur(26px) saturate(150%);box-shadow:0 24px 70px rgba(0,0,0,.55);opacity:0;transform:translateY(14px) scale(.97);pointer-events:none;transition:opacity .2s,transform .2s}
-#panel.open{opacity:1;transform:none;pointer-events:auto}
-#panel h3{font-size:16px;font-weight:600;margin-bottom:14px}
-.btnrow{display:flex;gap:8px;margin-bottom:14px}
-.btnrow .btn{flex:1}
-#modal{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(2,6,16,.6);backdrop-filter:blur(6px);opacity:0;pointer-events:none;transition:opacity .2s}
-#modal.open{opacity:1;pointer-events:auto}
-#card{width:min(380px,92vw);padding:24px;border-radius:24px;background:rgba(10,20,40,.94);border:1px solid rgba(160,210,255,.16);box-shadow:0 30px 80px rgba(0,0,0,.6);transform:translateY(12px) scale(.97);transition:transform .2s}
-#modal.open #card{transform:none}
-#card h3{font-size:18px;margin-bottom:16px}
-#card label{display:block;font-size:12px;opacity:.7;margin:0 0 6px 2px}
+.del:hover{background:var(--danger);color:#fff}
+.tile.add{border-style:dashed;color:var(--muted);cursor:pointer}
+.tile.add .fav{background:transparent;border:1px solid var(--line);color:var(--text)}
+.tile.add .fav b{color:var(--text);font-weight:400;font-size:18px}
+#gear{position:fixed;right:20px;bottom:18px;background:rgba(0,0,0,.35)}
+#drawer{position:fixed;top:0;right:0;bottom:0;width:320px;background:var(--panel);border-left:1px solid var(--line);transform:translateX(100%);transition:transform .18s;z-index:5;display:flex;flex-direction:column}
+#drawer.open{transform:none}
+.dh{display:flex;align-items:center;justify-content:space-between;height:52px;padding:0 18px;border-bottom:1px solid var(--line);font-weight:600}
+.dh button{width:28px;height:28px;color:var(--muted);font-size:18px}
+.dh button:hover{color:var(--text)}
+.db{padding:6px 18px;overflow:auto}
+.dr{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:14px 0;border-bottom:1px solid var(--line)}
+.dr:last-child{border-bottom:0}
+.dr .bt{display:flex;gap:8px}
+#modal{position:fixed;inset:0;display:none;align-items:center;justify-content:center;background:rgba(0,0,0,.55);z-index:8}
+#modal.open{display:flex}
+#card{width:min(400px,92vw);padding:22px;background:var(--panel);border:1px solid var(--line);border-radius:calc(4px * var(--rs))}
+#card h3{font-size:15px;font-weight:600;margin-bottom:16px}
+#card label{display:block;font-size:12.5px;color:var(--muted);margin:0 0 5px}
 #card input{width:100%;margin-bottom:14px}
-#card .btnrow{margin:6px 0 0}
-.shake{animation:sh .3s}
-@keyframes sh{25%{transform:translateX(-6px)}75%{transform:translateX(6px)}}
+#card .bt{display:flex;gap:8px;justify-content:flex-end;margin-top:6px}
+.shake{animation:sh .25s}
+@keyframes sh{25%{transform:translateX(-5px)}75%{transform:translateX(5px)}}
 </style>
 </head>
 <body>
-<div id=""bg"" class=""def""><i class=""blob b1""></i><i class=""blob b2""></i><i class=""blob b3""></i></div>
+<div id=""bg""><i class=""blob b1""></i><i class=""blob b2""></i></div>
 <canvas id=""snow""></canvas>
 <div id=""shade""></div>
-<div id=""brand""><img src=""assets/app-icon.ico"" alt=""""><span>Safoude</span></div>
+<header id=""top""><div class=""brand""><img src=""assets/app-icon.ico"" alt=""""><span>Safoude</span></div></header>
 
 <main>
-  <div id=""clockbox""><div id=""clock""></div><div id=""date""></div></div>
-  <form id=""sf"" autocomplete=""off"">
-    <svg class=""s"" viewBox=""0 0 24 24""><circle cx=""11"" cy=""11"" r=""7""/><path d=""M20 20l-3.6-3.6""/></svg>
-    <input id=""q"" type=""text"" data-ph=""addr_ph"" spellcheck=""false"" autofocus>
-    <button type=""button"" id=""ai""><svg viewBox=""0 0 24 24""><path d=""M12 2l2.1 6.2L20 10l-5.9 1.8L12 18l-2.1-6.2L4 10l5.9-1.8z""/><path d=""M19 15l.9 2.1L22 18l-2.1.9L19 21l-.9-2.1L16 18l2.1-.9z"" opacity="".8""/></svg><span data-i18n=""ai_mode""></span></button>
-  </form>
-  <div id=""tiles""></div>
-  <div id=""count""></div>
+  <div id=""box"">
+    <div id=""clock""></div>
+    <div id=""date""></div>
+    <form id=""sf"" autocomplete=""off"">
+      <svg class=""s"" viewBox=""0 0 24 24""><circle cx=""11"" cy=""11"" r=""7""/><path d=""M20 20l-3.6-3.6""/></svg>
+      <input id=""q"" type=""text"" data-ph=""addr_ph"" spellcheck=""false"" autofocus>
+      <button type=""button"" id=""ai""><svg viewBox=""0 0 24 24""><path d=""M12 2l2.1 6.2L20 10l-5.9 1.8L12 18l-2.1-6.2L4 10l5.9-1.8z""/></svg><span data-i18n=""ai_mode""></span></button>
+    </form>
+    <div class=""bmh"" id=""bmh""><span data-i18n=""m_bookmarks""></span><span id=""count""></span></div>
+    <div id=""tiles""></div>
+  </div>
 </main>
 
-<button id=""gear"" data-tt=""customize""><svg viewBox=""0 0 24 24""><path d=""M12 3a9 9 0 100 18c1.1 0 1.7-.8 1.7-1.6 0-.5-.3-.9-.5-1.3-.3-.4-.5-.8-.5-1.3 0-.9.8-1.6 1.7-1.6H17a4 4 0 004-4c0-4.4-4-8.2-9-8.2z""/><circle cx=""7.5"" cy=""11"" r=""1""/><circle cx=""10.5"" cy=""7"" r=""1""/><circle cx=""15"" cy=""7.5"" r=""1""/></svg></button>
+<button id=""gear"" class=""btn sm""><svg width=""14"" height=""14"" viewBox=""0 0 24 24"" fill=""none"" stroke=""currentColor"" stroke-width=""2"" stroke-linecap=""round""><path d=""M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0""/><circle cx=""16"" cy=""6"" r=""2""/><circle cx=""10"" cy=""12"" r=""2""/><circle cx=""18"" cy=""18"" r=""2""/></svg><span data-i18n=""customize""></span></button>
 
-<div id=""panel"">
-  <h3 data-i18n=""customize""></h3>
-  <div class=""btnrow""><button class=""btn primary"" id=""pick"" data-i18n=""choose_img""></button><button class=""btn"" id=""clear"" data-i18n=""reset""></button></div>
-  <label class=""sw""><span data-i18n=""show_clock""></span><input type=""checkbox"" id=""clk""><span class=""t""></span></label>
-  <label class=""sw""><span data-i18n=""show_bm""></span><input type=""checkbox"" id=""tl""><span class=""t""></span></label>
-  <div class=""btnrow"" style=""margin:14px 0 0""><button class=""btn"" id=""allset"" data-i18n=""all_settings""></button></div>
-</div>
+<aside id=""drawer"">
+  <div class=""dh""><span data-i18n=""customize""></span><button id=""dclose"" aria-label=""Close"">×</button></div>
+  <div class=""db"">
+    <div class=""dr""><span data-i18n=""wallpaper""></span><span class=""bt""><button class=""btn sm primary"" id=""pick"" data-i18n=""choose_img""></button><button class=""btn sm"" id=""clear"" data-i18n=""reset""></button></span></div>
+    <div class=""dr""><span data-i18n=""show_clock""></span><label class=""sw""><input type=""checkbox"" id=""clk""><span class=""t""></span></label></div>
+    <div class=""dr""><span data-i18n=""show_bm""></span><label class=""sw""><input type=""checkbox"" id=""tl""><span class=""t""></span></label></div>
+    <div class=""dr""><span></span><button class=""btn sm"" id=""allset"" data-i18n=""all_settings""></button></div>
+  </div>
+</aside>
 
 <div id=""modal""><div id=""card"">
   <h3 data-i18n=""add_title""></h3>
   <label data-i18n=""name""></label><input id=""mt"" type=""text"" spellcheck=""false"">
   <label data-i18n=""site""></label><input id=""mu"" type=""text"" spellcheck=""false"" placeholder=""example.com"">
-  <div class=""btnrow""><button class=""btn"" id=""mc"" data-i18n=""cancel""></button><button class=""btn primary"" id=""ma"" data-i18n=""add""></button></div>
+  <div class=""bt""><button class=""btn"" id=""mc"" data-i18n=""cancel""></button><button class=""btn primary"" id=""ma"" data-i18n=""add""></button></div>
 </div></div>
 
 <script>
 var H=window.chrome&&window.chrome.webview;
-var S=/*STATE*/null||{t:{},bookmarks:[],downloads:[],langs:[],engines:[],maxBm:10};
+var S=/*STATE*/null||{t:{},bookmarks:[],downloads:[],langs:[],engines:[],maxBm:10,ui:{}};
+var DEF={base:'',accent:'#5b9dff',accent2:'',smooth:true,radius:100,tabr:6,snow:false,snowCount:80,snowColor:'',aurora:false,clock24:true,searchBg:'',dlBar:'',dlCompact:false,cardOp:100,pbNewtab:'',pbSettings:'',pbDownloads:''};
 function T(k,a){var s=(S.t&&S.t[k])||k;if(a){for(var i=0;i<a.length;i++)s=s.split('{'+i+'}').join(a[i]);}return s;}
 function $(id){return document.getElementById(id);}
 function esc(s){return String(s==null?'':s).replace(/[&<>""']/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','""':'&quot;',""'"":'&#39;'}[c];});}
 function post(o){if(H)H.postMessage(o);}
+function U(k){return(S.premium&&S.ui&&S.ui[k]!==undefined)?S.ui[k]:DEF[k];}
+function hex2rgb(h){var m=/^#([0-9a-f]{6})$/i.exec(h||'');if(!m)return null;var n=parseInt(m[1],16);return[(n>>16)&255,(n>>8)&255,n&255];}
+function mix(a,b,t){return[Math.round(a[0]+(b[0]-a[0])*t),Math.round(a[1]+(b[1]-a[1])*t),Math.round(a[2]+(b[2]-a[2])*t)];}
+function rgb(c,a){return a===undefined?'rgb('+c.join(',')+')':'rgba('+c.join(',')+','+a+')';}
+function lum(c){return(0.299*c[0]+0.587*c[1]+0.114*c[2])/255;}
 function i18n(){
   document.documentElement.lang=S.lang||'en';
   var a=document.querySelectorAll('[data-i18n]'),i;
@@ -3523,33 +4076,71 @@ function i18n(){
   a=document.querySelectorAll('[data-tt]');
   for(i=0;i<a.length;i++)a[i].title=T(a[i].getAttribute('data-tt'));
 }
-function theme(){var r=document.documentElement.style;if(S.premium&&S.accent)r.setProperty('--accent',S.accent);else r.removeProperty('--accent');}
+function theme(kind){
+  var r=document.documentElement.style;
+  ['--accent','--accent2','--bg','--bg2','--panel','--card','--line','--text','--muted','--rs','--barbg','--search','--search-fg','--snowc'].forEach(function(p){r.removeProperty(p);});
+  var acc=hex2rgb(U('accent')),acc2=hex2rgb(U('accent2'));
+  if(S.premium&&acc)r.setProperty('--accent',U('accent'));
+  if(acc2)r.setProperty('--accent2',U('accent2'));else if(S.premium&&acc)r.setProperty('--accent2',U('accent'));
+  var pb=(kind==='newtab'?U('pbNewtab'):kind==='settings'?U('pbSettings'):kind==='downloads'?U('pbDownloads'):'')||U('base');
+  var b=hex2rgb(pb);
+  var panel=[21,24,29];
+  if(b){
+    var light=lum(b)>0.55,w=light?[0,0,0]:[255,255,255];
+    panel=mix(b,w,light?.04:.04);
+    r.setProperty('--bg',rgb(b));r.setProperty('--bg2',rgb(mix(b,w,.03)));r.setProperty('--panel',rgb(panel));
+    r.setProperty('--line',rgb(mix(b,w,light?.16:.12)));
+    if(light){r.setProperty('--text','#14181f');r.setProperty('--muted','#566070');}
+  }
+  r.setProperty('--card',rgb(panel,U('cardOp')/100));
+  r.setProperty('--rs',U('radius')/100);
+  if(hex2rgb(U('dlBar')))r.setProperty('--barbg',U('dlBar'));
+  var sb=hex2rgb(U('searchBg'));
+  if(sb){r.setProperty('--search',U('searchBg'));r.setProperty('--search-fg',lum(sb)>0.58?'#15191f':'#f1f4f8');}
+  if(hex2rgb(U('snowColor')))r.setProperty('--snowc',U('snowColor'));
+  document.body.classList.toggle('nosmooth',!U('smooth'));
+}
 function fmt(n){if(n==null||n<0)return'';var u=['B','KB','MB','GB','TB'],i=0;while(n>=1024&&i<4){n/=1024;i++;}return(i?n.toFixed(n<10?1:0):n)+' '+u[i];}
-if(H)H.addEventListener('message',function(e){var d=e.data;if(d&&d.type==='state'){S=d.state;theme();i18n();if(window.onState)window.onState();}});
+if(H)H.addEventListener('message',function(e){var d=e.data;if(d&&d.type==='state'){S=d.state;theme(window.PAGE);i18n();if(window.onState)window.onState();}});
 
+window.PAGE='newtab';
 (function(){
+  var cv=$('snow'),sx=cv.getContext('2d'),W=0,Hh=0,flakes=[],snowOn=false;
+  function rs(){W=cv.width=innerWidth;Hh=cv.height=innerHeight;}
+  rs();addEventListener('resize',rs);
+  function build(){var n=U('snowCount');flakes=[];for(var i=0;i<n;i++)flakes.push({x:Math.random()*2400,y:Math.random()*1400,r:Math.random()*1.6+.4,s:Math.random()*.5+.15,d:Math.random()*6.28});}
+  function loop(){
+    if(snowOn){
+      sx.clearRect(0,0,W,Hh);sx.fillStyle=U('snowColor')||'#dfe7f3';
+      for(var i=0;i<flakes.length;i++){var q=flakes[i];q.y+=q.s;q.d+=.01;q.x+=Math.sin(q.d)*.3;if(q.y>Hh){q.y=-5;q.x=Math.random()*W;}
+        sx.globalAlpha=.25+q.r/4;sx.beginPath();sx.arc(q.x%W,q.y,q.r,0,6.283);sx.fill();}
+    }
+    requestAnimationFrame(loop);
+  }
+
   function apply(){
-    var bg=$('bg'),dim=S.premium?S.dim:30,blur=S.premium?S.blur:0;
+    theme('newtab');
+    var bg=$('bg'),dim=S.premium?S.dim:30,blur=S.premium?S.blur:0,st=document.documentElement.style;
+    if(S.premium&&hex2rgb(U('accent')))st.setProperty('--blob1',U('accent'));else st.removeProperty('--blob1');
+    if(hex2rgb(U('accent2')))st.setProperty('--blob2',U('accent2'));else if(S.premium&&hex2rgb(U('accent')))st.setProperty('--blob2',U('accent'));else st.removeProperty('--blob2');
     if(S.wallpaper){
-      bg.className='';
-      bg.style.backgroundImage='url(""assets/'+encodeURIComponent(S.wallpaper)+'"")';
+      bg.style.backgroundImage='url(""wallpaper/'+encodeURIComponent(S.wallpaper)+'"")';
       bg.style.filter=blur>0?'blur('+blur+'px)':'none';
       $('shade').style.opacity=dim/100;
-      $('snow').style.display='none';
     }else{
-      bg.className='def';bg.style.backgroundImage='';bg.style.filter='none';
-      $('shade').style.opacity=.05;$('snow').style.display='block';
+      bg.style.backgroundImage='';bg.style.filter='none';$('shade').style.opacity=0;
     }
-    $('clockbox').style.display=S.clock?'':'none';
-    $('tiles').style.display=S.tiles?'':'none';
-    $('count').style.display=S.tiles?'':'none';
+    bg.className=(U('aurora')&&!S.wallpaper)?'glow':'';
+    snowOn=!!U('snow');$('snow').style.display=snowOn?'block':'none';build();
+    $('clock').style.display=S.clock?'':'none';$('date').style.display=S.clock?'':'none';
+    $('bmh').style.display=S.tiles?'':'none';$('tiles').style.display=S.tiles?'':'none';
     $('clk').checked=!!S.clock;$('tl').checked=!!S.tiles;
-    renderTiles();
+    renderTiles();tick();
   }
   function tick(){
     var d=new Date(),loc=S.lang||'en';
     try{
-      $('clock').textContent=d.toLocaleTimeString(loc,{hour:'2-digit',minute:'2-digit'});
+      $('clock').textContent=d.toLocaleTimeString(loc,{hour:'2-digit',minute:'2-digit',hour12:!U('clock24')});
       var s=d.toLocaleDateString(loc,{weekday:'long',day:'numeric',month:'long'});
       $('date').textContent=s.charAt(0).toUpperCase()+s.slice(1);
     }catch(e){}
@@ -3558,26 +4149,26 @@ if(H)H.addEventListener('message',function(e){var d=e.data;if(d&&d.type==='state
   function renderTiles(){
     var box=$('tiles');box.innerHTML='';
     var list=S.bookmarks||[];
-    list.forEach(function(b,i){
-      var a=document.createElement('a');a.className='tile';a.href=b.url;a.style.animationDelay=(i*30)+'ms';
-      var ico=document.createElement('div');ico.className='ico';
+    list.forEach(function(b){
+      var a=document.createElement('a');a.className='tile';a.href=b.url;
+      var f=document.createElement('div');f.className='fav';
       var h=hostOf(b.url),l=document.createElement('b');
       l.textContent=(b.title||h||'?').charAt(0).toUpperCase();
-      if(h){var img=new Image();img.onload=function(){ico.innerHTML='';ico.appendChild(img);};img.src='https://www.google.com/s2/favicons?domain='+encodeURIComponent(h)+'&sz=64';}
-      ico.appendChild(l);
-      var t=document.createElement('div');t.className='ttl';t.textContent=b.title||h||b.url;
+      if(h){var img=new Image();img.onload=function(){f.innerHTML='';f.appendChild(img);};img.src='https://www.google.com/s2/favicons?domain='+encodeURIComponent(h)+'&sz=64';}
+      f.appendChild(l);
+      var t=document.createElement('div');t.className='tt';t.textContent=b.title||h||b.url;
       var d=document.createElement('button');d.className='del';d.textContent='\u00d7';d.title=T('del');
       d.addEventListener('click',function(ev){ev.preventDefault();ev.stopPropagation();post({type:'removeBookmark',url:b.url});});
-      a.appendChild(d);a.appendChild(ico);a.appendChild(t);box.appendChild(a);
+      a.appendChild(f);a.appendChild(t);a.appendChild(d);box.appendChild(a);
     });
     if(list.length<(S.maxBm||10)){
       var add=document.createElement('div');add.className='tile add';
-      add.innerHTML='<div class=""ico""><b>+</b></div><div class=""ttl"">'+esc(T('add'))+'</div>';
+      add.innerHTML='<div class=""fav""><b>+</b></div><div class=""tt"">'+esc(T('add'))+'</div>';
       add.addEventListener('click',openModal);box.appendChild(add);
     }
-    $('count').textContent=T('bm_count')+'  '+list.length+' / '+(S.maxBm||10);
+    $('count').textContent=list.length+' / '+(S.maxBm||10);
   }
-  function openModal(){$('mt').value='';$('mu').value='';$('modal').classList.add('open');setTimeout(function(){$('mt').focus();},60);}
+  function openModal(){$('mt').value='';$('mu').value='';$('modal').classList.add('open');setTimeout(function(){$('mt').focus();},40);}
   function closeModal(){$('modal').classList.remove('open');}
   function norm(u){u=u.trim();if(!u)return'';if(!/^[a-z][a-z0-9+.-]*:\/\//i.test(u))u='https://'+u;return u;}
   function submit(){
@@ -3590,38 +4181,23 @@ if(H)H.addEventListener('message',function(e){var d=e.data;if(d&&d.type==='state
   $('ma').addEventListener('click',submit);
   $('modal').addEventListener('mousedown',function(e){if(e.target===$('modal'))closeModal();});
   $('card').addEventListener('keydown',function(e){if(e.key==='Enter')submit();});
-  document.addEventListener('keydown',function(e){if(e.key==='Escape'){closeModal();$('panel').classList.remove('open');}});
+  document.addEventListener('keydown',function(e){if(e.key==='Escape'){closeModal();$('drawer').classList.remove('open');}});
 
   $('sf').addEventListener('submit',function(e){e.preventDefault();var v=$('q').value.trim();if(v)post({type:'navigate',text:v});});
   $('ai').addEventListener('click',function(){location.href='https://foude.netlify.app/';});
 
-  $('gear').addEventListener('click',function(e){e.stopPropagation();$('panel').classList.toggle('open');});
-  $('panel').addEventListener('click',function(e){e.stopPropagation();});
-  document.addEventListener('click',function(){$('panel').classList.remove('open');});
+  $('gear').addEventListener('click',function(e){e.stopPropagation();$('drawer').classList.toggle('open');});
+  $('dclose').addEventListener('click',function(){$('drawer').classList.remove('open');});
+  $('drawer').addEventListener('click',function(e){e.stopPropagation();});
+  document.addEventListener('click',function(){$('drawer').classList.remove('open');});
   $('pick').addEventListener('click',function(){post({type:'pickWallpaper'});});
   $('clear').addEventListener('click',function(){post({type:'clearWallpaper'});});
   $('clk').addEventListener('change',function(){post({type:'set',key:'clock',value:this.checked});});
   $('tl').addEventListener('change',function(){post({type:'set',key:'tiles',value:this.checked});});
   $('allset').addEventListener('click',function(){post({type:'openUrl',url:'safoude://settings'});});
 
-  (function(){
-    var c=$('snow'),x=c.getContext('2d'),w=0,h=0,p=[],i;
-    function rs(){w=c.width=innerWidth;h=c.height=innerHeight;}
-    rs();addEventListener('resize',rs);
-    for(i=0;i<80;i++)p.push({x:Math.random()*2400,y:Math.random()*1400,r:Math.random()*1.8+.4,s:Math.random()*.5+.15,d:Math.random()*6.28});
-    function f(){
-      if(c.style.display!=='none'){
-        x.clearRect(0,0,w,h);x.fillStyle='#dcf0ff';
-        for(var i=0;i<p.length;i++){var q=p[i];q.y+=q.s;q.d+=.01;q.x+=Math.sin(q.d)*.3;if(q.y>h){q.y=-5;q.x=Math.random()*w;}
-          x.globalAlpha=.2+q.r/4;x.beginPath();x.arc(q.x%w,q.y,q.r,0,6.283);x.fill();}
-      }
-      requestAnimationFrame(f);
-    }
-    f();
-  })();
-
   window.onState=apply;
-  theme();i18n();apply();tick();setInterval(tick,1000);
+  i18n();apply();setInterval(tick,1000);loop();
   post({type:'ready'});
   $('q').focus();
 })();
@@ -3638,75 +4214,91 @@ if(H)H.addEventListener('message',function(e){var d=e.data;if(d&&d.type==='state
 <link rel=""icon"" href=""assets/app-icon.ico"">
 <meta name=""viewport"" content=""width=device-width, initial-scale=1"">
 <style>
-:root{--accent:#38bdf8;--accent2:#6366f1;--bg:#050b17;--card:rgba(14,24,44,.72);--stroke:rgba(140,190,255,.17);--text:#e9f2ff;--muted:#8ea6c6;--danger:#ff5d6c;--ok:#4ade80}
+:root{--accent:#5b9dff;--accent2:#5b9dff;--bg:#0e1013;--bg2:#12151a;--panel:#15181d;--card:rgb(21,24,29);--line:#262b33;--text:#e6e9ee;--muted:#8b94a1;--danger:#e05656;--ok:#6ec896;--rs:1;--barbg:linear-gradient(90deg,var(--accent),var(--accent2))}
 *{box-sizing:border-box;margin:0;padding:0}
 html,body{height:100%}
-body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--text);user-select:none;-webkit-user-select:none}
+body{font:14px/1.5 'Segoe UI',system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--text);user-select:none;-webkit-user-select:none;-webkit-font-smoothing:antialiased}
 button,input,select{font:inherit;color:inherit}
-button{cursor:pointer}
-.btn{height:38px;padding:0 18px;border-radius:12px;border:1px solid var(--stroke);background:rgba(255,255,255,.06);transition:background .15s,transform .1s}
-.btn:hover{background:rgba(255,255,255,.14)}
-.btn:active{transform:scale(.97)}
-.btn.primary{border:0;color:#03101f;font-weight:600;background:linear-gradient(120deg,var(--accent),var(--accent2))}
-.btn.primary:hover{filter:brightness(1.1);background:linear-gradient(120deg,var(--accent),var(--accent2))}
-.btn.sm{height:32px;padding:0 12px;border-radius:10px;font-size:13px}
-.btn.danger:hover{background:var(--danger);border-color:transparent;color:#fff}
-select,input[type=text]{height:40px;border-radius:12px;border:1px solid var(--stroke);background:rgba(10,20,40,.85);padding:0 12px;outline:0;user-select:text;-webkit-user-select:text}
-select:focus,input[type=text]:focus{border-color:var(--accent)}
-option{background:#0b1426}
-.sw{display:flex;align-items:center;justify-content:space-between;gap:16px;cursor:pointer;padding:7px 0}
+button{cursor:pointer;background:none;border:0}
+:focus-visible{outline:1px solid var(--accent);outline-offset:2px}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;height:34px;padding:0 16px;border:1px solid var(--line);border-radius:calc(4px * var(--rs));background:transparent;transition:background .12s,border-color .12s}
+.btn:hover{background:rgba(255,255,255,.06);border-color:#3b424d}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#0b0d10;font-weight:600}
+.btn.primary:hover{filter:brightness(1.08);background:var(--accent)}
+.btn.sm{height:28px;padding:0 10px;font-size:12.5px}
+.btn.danger:hover{background:var(--danger);border-color:var(--danger);color:#fff}
+input[type=text]{height:34px;border:1px solid var(--line);border-radius:calc(4px * var(--rs));background:rgba(0,0,0,.28);padding:0 10px;outline:0;user-select:text;-webkit-user-select:text}
+input[type=text]:focus{border-color:var(--accent)}
+.sw{display:flex;align-items:center;cursor:pointer}
 .sw input{display:none}
-.sw .t{position:relative;flex:none;width:44px;height:24px;border-radius:12px;background:rgba(255,255,255,.18);transition:background .2s}
-.sw .t::after{content:"""";position:absolute;left:3px;top:3px;width:18px;height:18px;border-radius:50%;background:#fff;transition:transform .2s}
+.sw .t{position:relative;flex:none;width:38px;height:20px;border-radius:calc(3px * var(--rs));background:#2b313a;transition:background .15s}
+.sw .t::after{content:"""";position:absolute;left:3px;top:3px;width:14px;height:14px;border-radius:calc(2px * var(--rs));background:#cdd3dc;transition:transform .15s}
 .sw input:checked+.t{background:var(--accent)}
-.sw input:checked+.t::after{transform:translateX(20px)}
-input[type=range]{width:100%;accent-color:var(--accent);cursor:pointer}
-::-webkit-scrollbar{width:10px}
-::-webkit-scrollbar-thumb{background:rgba(150,190,255,.25);border-radius:6px}
+.sw input:checked+.t::after{transform:translateX(18px);background:#fff}
+input[type=range]{accent-color:var(--accent);cursor:pointer}
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-thumb{background:#2c323b;border:2px solid transparent;background-clip:content-box}
 ::-webkit-scrollbar-track{background:transparent}
+.nosmooth *,.nosmooth *::before,.nosmooth *::after{transition:none!important;animation:none!important}
 
-body{background:radial-gradient(1000px 600px at 0% 0%,#0c2447 0%,transparent 60%),radial-gradient(900px 600px at 100% 100%,#141f55 0%,transparent 60%),#050b17;overflow:hidden}
-#app{display:flex;height:100%}
-#side{width:272px;flex:none;padding:26px 16px;border-right:1px solid var(--stroke);background:rgba(8,16,32,.55);backdrop-filter:blur(18px)}
-.brand{display:flex;align-items:center;gap:12px;padding:0 10px 22px;font-size:20px;font-weight:700;letter-spacing:.3px}
-.brand img{width:34px;height:34px;border-radius:10px;box-shadow:0 6px 20px rgba(0,0,0,.4)}
-.nav{display:flex;align-items:center;gap:12px;width:100%;height:44px;padding:0 12px;margin-bottom:4px;border:0;border-radius:12px;background:transparent;text-align:left;font-size:14.5px;color:var(--muted);transition:background .15s,color .15s}
-.nav svg{flex:none;width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
-.nav:hover{background:rgba(255,255,255,.07);color:var(--text)}
-.nav.on{background:linear-gradient(120deg,rgba(56,189,248,.22),rgba(99,102,241,.2));color:#fff;box-shadow:inset 0 0 0 1px rgba(140,200,255,.25)}
-.nav .badge{margin-left:auto;font-size:10.5px;padding:2px 8px;border-radius:9px;background:linear-gradient(120deg,var(--accent),var(--accent2));color:#03101f;font-weight:700}
-#main{flex:1;overflow-y:auto;padding:34px 44px 60px}
-.wrap{max-width:760px;margin:0 auto;animation:in .3s both}
-@keyframes in{from{opacity:0;transform:translateY(10px)}}
-h1{font-size:28px;font-weight:600;margin-bottom:22px}
-.card{background:var(--card);border:1px solid var(--stroke);border-radius:18px;padding:20px 22px;margin-bottom:16px;backdrop-filter:blur(14px)}
-.card h2{font-size:15px;font-weight:600;margin-bottom:4px}
-.card .sub{font-size:12.5px;color:var(--muted);margin-bottom:14px}
-.card select{width:100%;max-width:360px}
-.opt{display:flex;align-items:center;gap:14px;padding:13px 14px;margin-top:8px;border-radius:14px;border:1px solid var(--stroke);background:rgba(255,255,255,.03);cursor:pointer;transition:background .15s,border-color .15s}
-.opt:hover{background:rgba(255,255,255,.08)}
-.opt.on{border-color:var(--accent);background:rgba(56,189,248,.12)}
-.opt .dot{flex:none;width:18px;height:18px;border-radius:50%;border:2px solid var(--muted);position:relative}
-.opt.on .dot{border-color:var(--accent)}
-.opt.on .dot::after{content:"""";position:absolute;inset:3px;border-radius:50%;background:var(--accent)}
-.opt .nm{font-weight:500}
-.opt .tag{margin-left:auto;font-size:11px;padding:2px 9px;border-radius:9px;background:rgba(255,255,255,.1);color:var(--muted)}
-.row{display:flex;gap:10px;flex-wrap:wrap}
-.bm{display:flex;align-items:center;gap:12px;padding:10px 4px;border-bottom:1px solid var(--stroke)}
-.bm:last-child{border-bottom:0}
+body{overflow:hidden}
+#app{display:grid;grid-template-columns:248px minmax(0,1fr);height:100%}
+#side{border-right:1px solid var(--line);background:var(--panel);padding:18px 0;overflow:auto}
+.brand{display:flex;align-items:center;gap:10px;padding:0 20px 16px;font-weight:600}
+.brand img{width:22px;height:22px}
+.nav{display:flex;align-items:center;gap:10px;width:100%;height:38px;padding:0 20px 0 18px;color:var(--muted);text-align:left;border-left:2px solid transparent}
+.nav svg{flex:none;width:17px;height:17px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+.nav:hover{color:var(--text);background:rgba(255,255,255,.03)}
+.nav.on{color:var(--text);border-left-color:var(--accent);background:rgba(255,255,255,.05)}
+.nav .badge{margin-left:auto;font-size:10.5px;line-height:16px;padding:0 6px;border:1px solid var(--accent);color:var(--accent);border-radius:calc(3px * var(--rs))}
+#main{overflow:auto;padding:30px 44px 64px}
+.wrap{max-width:780px}
+h1{font-size:20px;font-weight:600;margin-bottom:4px}
+.lead{color:var(--muted);margin-bottom:8px;max-width:64ch}
+.grp{margin-top:28px}
+.grp>h2{font-size:13px;font-weight:600;color:var(--muted);padding-bottom:8px;border-bottom:1px solid var(--line)}
+.row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:28px;align-items:center;padding:14px 0;border-bottom:1px solid var(--line)}
+.row .l b{display:block;font-weight:500}
+.row .l span{display:block;color:var(--muted);font-size:12.5px;margin-top:2px}
+.row .c{display:flex;align-items:center;gap:8px}
+.dd{position:relative}
+.ddb{display:flex;align-items:center;gap:10px;min-width:240px;height:34px;padding:0 10px;border:1px solid var(--line);border-radius:calc(4px * var(--rs));background:rgba(0,0,0,.28);text-align:left}
+.ddb:hover{border-color:#3b424d}
+.ddb span{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ddb i{flex:none;width:7px;height:7px;border-right:1.5px solid var(--muted);border-bottom:1.5px solid var(--muted);transform:rotate(45deg) translate(-2px,-2px)}
+.ddl{position:absolute;right:0;top:38px;width:300px;max-height:320px;display:flex;flex-direction:column;background:var(--panel);border:1px solid var(--line);border-radius:calc(4px * var(--rs));box-shadow:0 12px 30px rgba(0,0,0,.45);z-index:20}
+.ddl[hidden]{display:none}
+.dds{margin:8px;width:calc(100% - 16px)}
+.ddi{overflow:auto;padding:0 0 4px}
+.ddo{display:flex;align-items:center;gap:10px;height:32px;padding:0 12px;cursor:pointer}
+.ddo:hover{background:rgba(255,255,255,.06)}
+.ddo.on{color:var(--accent)}
+.ddo span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.fl{flex:none;width:20px;height:15px;object-fit:cover;border:1px solid var(--line);background:#1b1f26}
+.opt{display:flex;align-items:center;gap:12px;height:44px;padding:0 4px;border-bottom:1px solid var(--line);cursor:pointer}
+.opt:hover{background:rgba(255,255,255,.03)}
+.opt .d{flex:none;width:14px;height:14px;border-radius:50%;border:1.5px solid var(--muted);position:relative}
+.opt.on .d{border-color:var(--accent)}
+.opt.on .d::after{content:"""";position:absolute;inset:2.5px;border-radius:50%;background:var(--accent)}
+.opt .tag{margin-left:auto;font-size:11.5px;color:var(--muted)}
+.bm{display:flex;align-items:center;gap:14px;padding:10px 0;border-bottom:1px solid var(--line)}
 .bm .t{flex:1;min-width:0}
 .bm .t b{display:block;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .bm .t span{display:block;font-size:12px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.kv{display:flex;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--stroke);font-size:14px}
-.kv:last-child{border-bottom:0}
+.kv{display:flex;justify-content:space-between;gap:20px;padding:11px 0;border-bottom:1px solid var(--line)}
 .kv span:first-child{color:var(--muted)}
-.sw0{display:flex;flex-wrap:wrap;gap:10px;margin-top:6px}
-.swatch{width:34px;height:34px;border-radius:50%;border:2px solid transparent;cursor:pointer;transition:transform .15s}
-.swatch:hover{transform:scale(1.12)}
-.swatch.on{border-color:#fff;box-shadow:0 0 0 3px rgba(255,255,255,.2)}
-.pill{display:inline-block;font-size:12px;padding:3px 12px;border-radius:12px;background:rgba(74,222,128,.16);color:var(--ok);font-weight:600;margin-bottom:12px}
-.lab{display:flex;justify-content:space-between;font-size:13px;margin:12px 0 6px}
-.lab span:last-child{color:var(--muted)}
+.kv span:last-child{text-align:right;word-break:break-all}
+.pill{display:inline-block;font-size:12px;padding:1px 8px;border:1px solid var(--ok);color:var(--ok);border-radius:calc(3px * var(--rs));margin-bottom:10px}
+.gtabs{display:flex;gap:2px;margin:22px 0 0;border-bottom:1px solid var(--line);flex-wrap:wrap}
+.gt{height:36px;padding:0 14px;color:var(--muted);border-bottom:2px solid transparent;margin-bottom:-1px}
+.gt:hover{color:var(--text)}
+.gt.on{color:var(--text);border-bottom-color:var(--accent)}
+.cc{display:flex;align-items:center;gap:8px}
+.cp{width:34px;height:34px;padding:2px;border:1px solid var(--line);border-radius:calc(4px * var(--rs));background:transparent;cursor:pointer}
+.ch{width:104px;font-variant-numeric:tabular-nums}
+.rg{display:flex;align-items:center;gap:12px}
+.rg input{width:190px}
+.rv{width:54px;text-align:right;color:var(--muted);font-variant-numeric:tabular-nums}
 </style>
 </head>
 <body>
@@ -3716,11 +4308,17 @@ h1{font-size:28px;font-weight:600;margin-bottom:22px}
 </div>
 <script>
 var H=window.chrome&&window.chrome.webview;
-var S=/*STATE*/null||{t:{},bookmarks:[],downloads:[],langs:[],engines:[],maxBm:10};
+var S=/*STATE*/null||{t:{},bookmarks:[],downloads:[],langs:[],engines:[],maxBm:10,ui:{}};
+var DEF={base:'',accent:'#5b9dff',accent2:'',smooth:true,radius:100,tabr:6,snow:false,snowCount:80,snowColor:'',aurora:false,clock24:true,searchBg:'',dlBar:'',dlCompact:false,cardOp:100,pbNewtab:'',pbSettings:'',pbDownloads:''};
 function T(k,a){var s=(S.t&&S.t[k])||k;if(a){for(var i=0;i<a.length;i++)s=s.split('{'+i+'}').join(a[i]);}return s;}
 function $(id){return document.getElementById(id);}
 function esc(s){return String(s==null?'':s).replace(/[&<>""']/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','""':'&quot;',""'"":'&#39;'}[c];});}
 function post(o){if(H)H.postMessage(o);}
+function U(k){return(S.premium&&S.ui&&S.ui[k]!==undefined)?S.ui[k]:DEF[k];}
+function hex2rgb(h){var m=/^#([0-9a-f]{6})$/i.exec(h||'');if(!m)return null;var n=parseInt(m[1],16);return[(n>>16)&255,(n>>8)&255,n&255];}
+function mix(a,b,t){return[Math.round(a[0]+(b[0]-a[0])*t),Math.round(a[1]+(b[1]-a[1])*t),Math.round(a[2]+(b[2]-a[2])*t)];}
+function rgb(c,a){return a===undefined?'rgb('+c.join(',')+')':'rgba('+c.join(',')+','+a+')';}
+function lum(c){return(0.299*c[0]+0.587*c[1]+0.114*c[2])/255;}
 function i18n(){
   document.documentElement.lang=S.lang||'en';
   var a=document.querySelectorAll('[data-i18n]'),i;
@@ -3730,118 +4328,201 @@ function i18n(){
   a=document.querySelectorAll('[data-tt]');
   for(i=0;i<a.length;i++)a[i].title=T(a[i].getAttribute('data-tt'));
 }
-function theme(){var r=document.documentElement.style;if(S.premium&&S.accent)r.setProperty('--accent',S.accent);else r.removeProperty('--accent');}
+function theme(kind){
+  var r=document.documentElement.style;
+  ['--accent','--accent2','--bg','--bg2','--panel','--card','--line','--text','--muted','--rs','--barbg','--search','--search-fg','--snowc'].forEach(function(p){r.removeProperty(p);});
+  var acc=hex2rgb(U('accent')),acc2=hex2rgb(U('accent2'));
+  if(S.premium&&acc)r.setProperty('--accent',U('accent'));
+  if(acc2)r.setProperty('--accent2',U('accent2'));else if(S.premium&&acc)r.setProperty('--accent2',U('accent'));
+  var pb=(kind==='newtab'?U('pbNewtab'):kind==='settings'?U('pbSettings'):kind==='downloads'?U('pbDownloads'):'')||U('base');
+  var b=hex2rgb(pb);
+  var panel=[21,24,29];
+  if(b){
+    var light=lum(b)>0.55,w=light?[0,0,0]:[255,255,255];
+    panel=mix(b,w,light?.04:.04);
+    r.setProperty('--bg',rgb(b));r.setProperty('--bg2',rgb(mix(b,w,.03)));r.setProperty('--panel',rgb(panel));
+    r.setProperty('--line',rgb(mix(b,w,light?.16:.12)));
+    if(light){r.setProperty('--text','#14181f');r.setProperty('--muted','#566070');}
+  }
+  r.setProperty('--card',rgb(panel,U('cardOp')/100));
+  r.setProperty('--rs',U('radius')/100);
+  if(hex2rgb(U('dlBar')))r.setProperty('--barbg',U('dlBar'));
+  var sb=hex2rgb(U('searchBg'));
+  if(sb){r.setProperty('--search',U('searchBg'));r.setProperty('--search-fg',lum(sb)>0.58?'#15191f':'#f1f4f8');}
+  if(hex2rgb(U('snowColor')))r.setProperty('--snowc',U('snowColor'));
+  document.body.classList.toggle('nosmooth',!U('smooth'));
+}
 function fmt(n){if(n==null||n<0)return'';var u=['B','KB','MB','GB','TB'],i=0;while(n>=1024&&i<4){n/=1024;i++;}return(i?n.toFixed(n<10?1:0):n)+' '+u[i];}
-if(H)H.addEventListener('message',function(e){var d=e.data;if(d&&d.type==='state'){S=d.state;theme();i18n();if(window.onState)window.onState();}});
+if(H)H.addEventListener('message',function(e){var d=e.data;if(d&&d.type==='state'){S=d.state;theme(window.PAGE);i18n();if(window.onState)window.onState();}});
 
+window.PAGE='settings';
 (function(){
   var ICONS={
     general:'<path d=""M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0""/><circle cx=""16"" cy=""6"" r=""2""/><circle cx=""10"" cy=""12"" r=""2""/><circle cx=""18"" cy=""18"" r=""2""/>',
     search:'<circle cx=""11"" cy=""11"" r=""7""/><path d=""M20 20l-3.6-3.6""/>',
-    appearance:'<circle cx=""12"" cy=""12"" r=""9""/><circle cx=""8"" cy=""10"" r=""1""/><circle cx=""12"" cy=""7.5"" r=""1""/><circle cx=""16"" cy=""10"" r=""1""/>',
+    appearance:'<rect x=""4"" y=""4"" width=""16"" height=""16"" rx=""1""/><path d=""M4 10h16M10 10v10""/>',
     bookmarks:'<path d=""M6 4h12v17l-6-4-6 4z""/>',
     advanced:'<path d=""M12 3l2.4 5.6L20 11l-5.6 2.4L12 19l-2.4-5.6L4 11l5.6-2.4z""/>',
+    max:'<path d=""M12 3v4M12 17v4M3 12h4M17 12h4M6 6l2.5 2.5M15.5 15.5L18 18M18 6l-2.5 2.5M8.5 15.5L6 18""/>',
     about:'<circle cx=""12"" cy=""12"" r=""9""/><path d=""M12 11v6""/><circle cx=""12"" cy=""7.6"" r="".6""/>'
   };
-  var SECS=[['general','sec_general'],['search','sec_search'],['appearance','sec_appearance'],['bookmarks','sec_bookmarks'],['advanced','sec_adv'],['about','sec_about']];
-  var COUNTRIES=[['US','United States'],['GB','United Kingdom'],['CA','Canada'],['AU','Australia'],['NZ','New Zealand'],['IE','Ireland'],['RU','Russia'],['UA','Ukraine'],['BY','Belarus'],['KZ','Kazakhstan'],['PL','Poland'],['CZ','Czechia'],['DE','Germany'],['AT','Austria'],['CH','Switzerland'],['FR','France'],['BE','Belgium'],['NL','Netherlands'],['ES','Spain'],['PT','Portugal'],['IT','Italy'],['GR','Greece'],['SE','Sweden'],['NO','Norway'],['DK','Denmark'],['FI','Finland'],['TR','Turkey'],['IL','Israel'],['AE','United Arab Emirates'],['SA','Saudi Arabia'],['EG','Egypt'],['IN','India'],['CN','China'],['JP','Japan'],['KR','South Korea'],['SG','Singapore'],['TH','Thailand'],['VN','Vietnam'],['ID','Indonesia'],['BR','Brazil'],['AR','Argentina'],['MX','Mexico'],['CL','Chile'],['CO','Colombia'],['ZA','South Africa'],['NG','Nigeria']];
-  var COLORS=['#38bdf8','#22d3ee','#2dd4bf','#818cf8','#a78bfa','#f472b6','#fb923c','#a3e635'];
-  var cur='general';
+  var SECS=[['general','sec_general'],['search','sec_search'],['appearance','sec_appearance'],['bookmarks','sec_bookmarks'],['advanced','sec_adv'],['max','sec_max'],['about','sec_about']];
+  var PRO={advanced:1,max:1};
+  var CODES='US GB CA AU NZ IE RU UA BY KZ UZ GE AM AZ PL CZ SK HU RO BG RS HR SI LT LV EE DE AT CH FR BE NL LU ES PT IT GR SE NO DK FI IS TR IL AE SA EG IN PK BD CN HK JP KR TW SG TH VN ID MY PH BR AR MX CL CO PE ZA NG KE MA'.split(' ');
+  var ENNAMES={US:'United States',GB:'United Kingdom',CA:'Canada',AU:'Australia',NZ:'New Zealand',IE:'Ireland',RU:'Russia',UA:'Ukraine',BY:'Belarus',KZ:'Kazakhstan',UZ:'Uzbekistan',GE:'Georgia',AM:'Armenia',AZ:'Azerbaijan',PL:'Poland',CZ:'Czechia',SK:'Slovakia',HU:'Hungary',RO:'Romania',BG:'Bulgaria',RS:'Serbia',HR:'Croatia',SI:'Slovenia',LT:'Lithuania',LV:'Latvia',EE:'Estonia',DE:'Germany',AT:'Austria',CH:'Switzerland',FR:'France',BE:'Belgium',NL:'Netherlands',LU:'Luxembourg',ES:'Spain',PT:'Portugal',IT:'Italy',GR:'Greece',SE:'Sweden',NO:'Norway',DK:'Denmark',FI:'Finland',IS:'Iceland',TR:'Turkey',IL:'Israel',AE:'United Arab Emirates',SA:'Saudi Arabia',EG:'Egypt',IN:'India',PK:'Pakistan',BD:'Bangladesh',CN:'China',HK:'Hong Kong',JP:'Japan',KR:'South Korea',TW:'Taiwan',SG:'Singapore',TH:'Thailand',VN:'Vietnam',ID:'Indonesia',MY:'Malaysia',PH:'Philippines',BR:'Brazil',AR:'Argentina',MX:'Mexico',CL:'Chile',CO:'Colombia',PE:'Peru',ZA:'South Africa',NG:'Nigeria',KE:'Kenya',MA:'Morocco'};
+  var DEFCOL={base:'#14171c',accent:'#5b9dff',accent2:'#5b9dff',snowColor:'#dfe7f3',searchBg:'#ffffff',dlBar:'#5b9dff',pbNewtab:'#0e1013',pbSettings:'#0e1013',pbDownloads:'#0e1013'};
+  var MAX=[
+    {id:'all',t:'grp_all',c:[['color','base','c_base'],['color','accent','accent'],['color','accent2','c_accent2'],['toggle','smooth','c_smooth'],['range','radius','c_radius',50,150,'%']]},
+    {id:'win',t:'grp_win',c:[['range','tabr','c_tabr',0,16,' px']]},
+    {id:'nt',t:'grp_nt',c:[['color','pbNewtab','c_pagebase'],['toggle','snow','c_snow'],['range','snowCount','c_snowcount',0,200,''],['color','snowColor','c_snowcol'],['toggle','aurora','c_aurora'],['toggle','clock24','c_clock24'],['color','searchBg','c_search']]},
+    {id:'dl',t:'grp_dl',c:[['color','pbDownloads','c_pagebase'],['color','dlBar','c_bar'],['toggle','dlCompact','c_compact']]},
+    {id:'set',t:'grp_set',c:[['color','pbSettings','c_pagebase'],['range','cardOp','c_cardop',20,100,'%']]}
+  ];
+  var cur='general',mg='all';
 
   function ico(k){return '<svg viewBox=""0 0 24 24"">'+ICONS[k]+'</svg>';}
-
   function nav(){
     var h='';
     SECS.forEach(function(s){
-      var badge=(s[0]==='advanced'&&!S.premium)?'<span class=""badge"">PRO</span>':'';
-      h+='<button class=""nav'+(cur===s[0]?' on':'')+'"" data-sec=""'+s[0]+'"">'+ico(s[0])+'<span>'+esc(T(s[1]))+'</span>'+badge+'</button>';
+      h+='<button class=""nav'+(cur===s[0]?' on':'')+'"" data-sec=""'+s[0]+'"">'+ico(s[0])+'<span>'+esc(T(s[1]))+'</span>'+(PRO[s[0]]&&!S.premium?'<span class=""badge"">PRO</span>':'')+'</button>';
     });
     $('nav').innerHTML=h;
   }
-
-  function sw(id,key,on){return '<label class=""sw""><span>'+esc(T(key))+'</span><input type=""checkbox"" id=""'+id+'""'+(on?' checked':'')+'><span class=""t""></span></label>';}
+  function row(label,ctl,desc){return '<div class=""row""><div class=""l""><b>'+esc(label)+'</b>'+(desc?'<span>'+esc(desc)+'</span>':'')+'</div><div class=""c"">'+ctl+'</div></div>';}
+  function tog(key,val){return '<label class=""sw""><input type=""checkbox"" data-tk=""'+key+'""'+(val?' checked':'')+'><span class=""t""></span></label>';}
+  function flag(c){return '<img class=""fl"" alt="""" loading=""lazy"" src=""https://flagcdn.com/w40/'+c.toLowerCase()+'.png"" onerror=""this.style.visibility=\'hidden\'"">';}
+  function dd(key,items,curv,flags){
+    var sel=items.filter(function(x){return x.v===curv;})[0]||items[0];
+    var h='<div class=""dd"" data-k=""'+key+'""><button type=""button"" class=""ddb"">'+(flags?flag(sel.v):'')+'<span>'+esc(sel.name)+'</span><i></i></button><div class=""ddl"" hidden>';
+    if(items.length>8)h+='<input type=""text"" class=""dds"" placeholder=""'+esc(T('ph_search'))+'"">';
+    h+='<div class=""ddi"">';
+    items.forEach(function(it){h+='<div class=""ddo'+(it.v===curv?' on':'')+'"" data-v=""'+esc(it.v)+'"">'+(flags?flag(it.v):'')+'<span>'+esc(it.name)+'</span></div>';});
+    return h+'</div></div></div>';
+  }
+  function countries(){
+    var dn=null;try{dn=new Intl.DisplayNames([S.lang||'en'],{type:'region'});}catch(e){}
+    var l=CODES.map(function(c){var n='';try{n=dn?dn.of(c):'';}catch(e){}return{v:c,name:n||ENNAMES[c]||c};});
+    l.sort(function(a,b){return a.name.localeCompare(b.name,S.lang||'en');});
+    return l;
+  }
+  function uiv(k){if(k==='blur')return S.blur;if(k==='dim')return S.dim;return(S.ui&&S.ui[k]!==undefined)?S.ui[k]:DEF[k];}
+  function ctl(d){
+    var t=d[0],k=d[1],lab=T(d[2]),v=uiv(k);
+    if(t==='toggle')return row(lab,tog(k,v));
+    if(t==='range')return row(lab,'<span class=""rg""><input type=""range"" data-rk=""'+k+'"" min=""'+d[3]+'"" max=""'+d[4]+'"" value=""'+v+'""><span class=""rv"" id=""rv_'+k+'"">'+v+d[5]+'</span></span>');
+    var shown=v||DEFCOL[k]||'#000000';
+    return row(lab,'<span class=""cc""><input type=""color"" class=""cp"" data-ck=""'+k+'"" value=""'+esc(shown)+'""><input type=""text"" class=""ch"" data-ck=""'+k+'"" maxlength=""7"" placeholder=""'+esc(T('c_default'))+'"" value=""'+esc(v)+'""><button class=""btn sm"" data-cr=""'+k+'"">'+esc(T('reset'))+'</button></span>');
+  }
 
   function body(){
-    var h='',i;
+    var h='',list;
     if(cur==='general'){
       h='<h1>'+esc(T('sec_general'))+'</h1>';
-      h+='<div class=""card""><h2>'+esc(T('language'))+'</h2><div class=""sub"">&nbsp;</div><select id=""lang"">';
-      (S.langs||[]).forEach(function(l){h+='<option value=""'+esc(l.code)+'""'+(l.code===S.lang?' selected':'')+'>'+esc(l.name)+'</option>';});
-      h+='</select></div>';
-      h+='<div class=""card""><h2>'+esc(T('country'))+'</h2><div class=""sub"">'+esc(T('country_note'))+'</div><select id=""country"">';
-      COUNTRIES.forEach(function(c){h+='<option value=""'+c[0]+'""'+(c[0]===S.country?' selected':'')+'>'+esc(c[1])+'</option>';});
-      h+='</select></div>';
+      h+='<div class=""grp""><h2>'+esc(T('grp_region'))+'</h2>';
+      h+=row(T('language'),dd('lang',(S.langs||[]).map(function(l){return{v:l.code,name:l.name};}),S.lang,false));
+      h+=row(T('country'),dd('country',countries(),S.country||'US',true),T('country_note'));
+      h+='</div><div class=""grp""><h2>'+esc(T('grp_behavior'))+'</h2>';
+      h+=row(T('close_tray'),tog('closeTray',S.closeTray));
+      h+=row(T('logs_on'),tog('logs',S.logs));
+      h+='</div>';
     }else if(cur==='search'){
-      h='<h1>'+esc(T('sec_search'))+'</h1><div class=""card""><h2>'+esc(T('engine'))+'</h2><div class=""sub"">&nbsp;</div>';
+      h='<h1>'+esc(T('sec_search'))+'</h1><div class=""grp""><h2>'+esc(T('engine'))+'</h2>';
       (S.engines||[]).forEach(function(e){
-        h+='<div class=""opt'+(e.id===S.engine?' on':'')+'"" data-eng=""'+esc(e.id)+'""><span class=""dot""></span><span class=""nm"">'+esc(e.name)+'</span>'+(e.id==='google'?'<span class=""tag"">default</span>':'')+'</div>';
+        h+='<div class=""opt'+(e.id===S.engine?' on':'')+'"" data-eng=""'+esc(e.id)+'""><span class=""d""></span><span>'+esc(e.name)+'</span>'+(e.id==='google'?'<span class=""tag"">'+esc(T('c_default'))+'</span>':'')+'</div>';
       });
       h+='</div>';
     }else if(cur==='appearance'){
-      h='<h1>'+esc(T('sec_appearance'))+'</h1><div class=""card""><h2>'+esc(T('wallpaper'))+'</h2><div class=""sub"">&nbsp;</div><div class=""row""><button class=""btn primary"" id=""pick"">'+esc(T('choose_img'))+'</button><button class=""btn"" id=""clear"">'+esc(T('reset'))+'</button></div></div>';
-      h+='<div class=""card"">'+sw('clk','show_clock',S.clock)+sw('tl','show_bm',S.tiles)+'</div>';
+      h='<h1>'+esc(T('sec_appearance'))+'</h1><div class=""grp""><h2>'+esc(T('grp_nt'))+'</h2>';
+      h+=row(T('wallpaper'),'<button class=""btn primary sm"" id=""pick"">'+esc(T('choose_img'))+'</button><button class=""btn sm"" id=""clear"">'+esc(T('reset'))+'</button>');
+      h+=row(T('show_clock'),tog('clock',S.clock));
+      h+=row(T('show_bm'),tog('tiles',S.tiles));
+      h+='</div>';
     }else if(cur==='bookmarks'){
-      var list=S.bookmarks||[];
-      h='<h1>'+esc(T('sec_bookmarks'))+'</h1><div class=""card""><h2>'+esc(T('bm_count'))+' '+list.length+' / '+(S.maxBm||10)+'</h2><div class=""sub"">&nbsp;</div>';
+      list=S.bookmarks||[];
+      h='<h1>'+esc(T('sec_bookmarks'))+'</h1><div class=""grp""><h2>'+esc(T('bm_count'))+'  '+list.length+' / '+(S.maxBm||10)+'</h2>';
       list.forEach(function(b,i){h+='<div class=""bm""><div class=""t""><b>'+esc(b.title||b.url)+'</b><span>'+esc(b.url)+'</span></div><button class=""btn sm danger"" data-del=""'+i+'"">'+esc(T('del'))+'</button></div>';});
       h+='</div>';
     }else if(cur==='advanced'){
-      h='<h1>'+esc(T('sec_adv'))+'</h1><div class=""card""><span class=""pill"">'+esc(T('adv_active'))+'</span><div class=""sub"" style=""margin:0"">'+esc(T('adv_desc',[S.maxBm]))+'</div></div>';
-      h+='<div class=""card""><h2>'+esc(T('accent'))+'</h2><div class=""sub"">&nbsp;</div><div class=""sw0"">';
-      COLORS.forEach(function(c){h+='<div class=""swatch'+((S.accent||'').toLowerCase()===c?' on':'')+'"" style=""background:'+c+'"" data-col=""'+c+'""></div>';});
-      h+='<input type=""color"" id=""cc"" value=""'+esc(S.accent||'#38bdf8')+'"" style=""width:34px;height:34px;border:0;background:none;padding:0;cursor:pointer""></div></div>';
-      h+='<div class=""card""><div class=""lab""><span>'+esc(T('blur'))+'</span><span id=""bv"">'+S.blur+' px</span></div><input type=""range"" id=""blur"" min=""0"" max=""24"" value=""'+S.blur+'"">';
-      h+='<div class=""lab""><span>'+esc(T('dim'))+'</span><span id=""dv"">'+S.dim+'%</span></div><input type=""range"" id=""dim"" min=""0"" max=""80"" value=""'+S.dim+'""></div>';
+      h='<h1>'+esc(T('sec_adv'))+'</h1><p class=""lead""><span class=""pill"">'+esc(T('adv_active'))+'</span><br>'+esc(T('adv_desc',[S.maxBm]))+'</p><div class=""grp"">';
+      h+=ctl(['color','accent','accent']);
+      h+=ctl(['range','blur','blur',0,24,' px']);
+      h+=ctl(['range','dim','dim',0,80,'%']);
+      h+='</div>';
+    }else if(cur==='max'){
+      h='<h1>'+esc(T('sec_max'))+'</h1><p class=""lead"">'+esc(T('max_desc'))+'</p><div class=""gtabs"">';
+      MAX.forEach(function(g){h+='<button class=""gt'+(g.id===mg?' on':'')+'"" data-g=""'+g.id+'"">'+esc(T(g.t))+'</button>';});
+      h+='</div><div class=""grp"" style=""margin-top:0"">';
+      MAX.filter(function(g){return g.id===mg;})[0].c.forEach(function(d){h+=ctl(d);});
+      h+='</div><div class=""grp""><div class=""row""><div class=""l""></div><div class=""c""><button class=""btn danger"" id=""resetall"">'+esc(T('c_reset'))+'</button></div></div></div>';
     }else{
-      h='<h1>'+esc(T('sec_about'))+'</h1><div class=""card"">';
+      h='<h1>'+esc(T('sec_about'))+'</h1><div class=""grp"">';
       h+='<div class=""kv""><span>Safoude</span><span>'+esc(S.version||'')+'</span></div>';
       h+='<div class=""kv""><span>'+esc(T('about_pack'))+'</span><span>'+esc(S.pack||'')+'</span></div>';
-      h+='<div class=""kv""><span>'+esc(T('about_mode'))+'</span><span>'+esc(S.webview?T('mode_wv'):T('mode_compat'))+'</span></div></div>';
-      h+='<div class=""card""><div class=""row""><button class=""btn"" id=""dl"">'+esc(T('m_downloads'))+'</button></div></div>';
+      h+='<div class=""kv""><span>'+esc(T('about_mode'))+'</span><span>'+esc(S.webview?T('mode_wv'):T('mode_compat'))+'</span></div>';
+      h+='<div class=""kv""><span>'+esc(T('logs_dir'))+'</span><span>'+esc(S.logDir||'')+'</span></div></div>';
+      h+='<div class=""grp""><div class=""row""><div class=""l""></div><div class=""c""><button class=""btn"" id=""openlogs"">'+esc(T('m_logs'))+'</button><button class=""btn"" id=""dlb"">'+esc(T('m_downloads'))+'</button></div></div></div>';
     }
     $('main').innerHTML='<div class=""wrap"">'+h+'</div>';
-    bind();
   }
 
   function set(k,v){post({type:'set',key:k,value:v});}
+  function closeDd(){var a=document.querySelectorAll('.ddl');for(var i=0;i<a.length;i++)a[i].hidden=true;}
 
-  function bind(){
-    var e;
-    if(e=$('lang'))e.onchange=function(){set('lang',this.value);};
-    if(e=$('country'))e.onchange=function(){set('country',this.value);};
-    if(e=$('pick'))e.onclick=function(){post({type:'pickWallpaper'});};
-    if(e=$('clear'))e.onclick=function(){post({type:'clearWallpaper'});};
-    if(e=$('clk'))e.onchange=function(){set('clock',this.checked);};
-    if(e=$('tl'))e.onchange=function(){set('tiles',this.checked);};
-    if(e=$('dl'))e.onclick=function(){post({type:'openUrl',url:'safoude://downloads'});};
-    if(e=$('cc'))e.onchange=function(){set('accent',this.value);};
-    if(e=$('blur')){e.oninput=function(){$('bv').textContent=this.value+' px';};e.onchange=function(){set('blur',+this.value);};}
-    if(e=$('dim')){e.oninput=function(){$('dv').textContent=this.value+'%';};e.onchange=function(){set('dim',+this.value);};}
-    var a=document.querySelectorAll('[data-eng]'),i;
-    for(i=0;i<a.length;i++)a[i].onclick=function(){set('engine',this.getAttribute('data-eng'));};
-    a=document.querySelectorAll('[data-col]');
-    for(i=0;i<a.length;i++)a[i].onclick=function(){set('accent',this.getAttribute('data-col'));};
-    a=document.querySelectorAll('[data-del]');
-    for(i=0;i<a.length;i++)a[i].onclick=function(){var b=(S.bookmarks||[])[+this.getAttribute('data-del')];if(b)post({type:'removeBookmark',url:b.url});};
-  }
+  $('main').addEventListener('click',function(e){
+    var t=e.target,x;
+    if((x=t.closest('.ddo'))){set(x.closest('.dd').getAttribute('data-k'),x.getAttribute('data-v'));return;}
+    if((x=t.closest('.ddb'))){
+      var l=x.parentNode.querySelector('.ddl'),was=!l.hidden;closeDd();
+      if(!was){l.hidden=false;var s=l.querySelector('.dds');if(s)s.focus();}
+      e.stopPropagation();return;
+    }
+    if(t.closest('.dds')){e.stopPropagation();return;}
+    if((x=t.closest('[data-eng]'))){set('engine',x.getAttribute('data-eng'));return;}
+    if((x=t.closest('[data-cr]'))){set(x.getAttribute('data-cr'),'');return;}
+    if((x=t.closest('[data-g]'))){mg=x.getAttribute('data-g');body();return;}
+    if((x=t.closest('[data-del]'))){var b=(S.bookmarks||[])[+x.getAttribute('data-del')];if(b)post({type:'removeBookmark',url:b.url});return;}
+    if(t.closest('#pick')){post({type:'pickWallpaper'});return;}
+    if(t.closest('#clear')){post({type:'clearWallpaper'});return;}
+    if(t.closest('#resetall')){set('resetCustom',true);return;}
+    if(t.closest('#openlogs')){post({type:'openLogs'});return;}
+    if(t.closest('#dlb')){post({type:'openUrl',url:'safoude://downloads'});return;}
+  });
+  $('main').addEventListener('change',function(e){
+    var t=e.target,k;
+    if((k=t.getAttribute('data-tk'))){set(k,t.checked);return;}
+    if((k=t.getAttribute('data-rk'))){set(k,+t.value);return;}
+    if((k=t.getAttribute('data-ck'))){
+      if(t.type==='color'){set(k,t.value);return;}
+      var v=t.value.trim();
+      if(v===''||/^#?([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(v))set(k,v);else body();
+    }
+  });
+  $('main').addEventListener('input',function(e){
+    var t=e.target,k;
+    if((k=t.getAttribute('data-rk'))){var el=$('rv_'+k);if(el){var u=el.textContent.replace(/^[-0-9.]+/,'');el.textContent=t.value+u;}return;}
+    if(t.classList.contains('dds')){
+      var q=t.value.toLowerCase(),a=t.parentNode.querySelectorAll('.ddo');
+      for(var i=0;i<a.length;i++)a[i].style.display=a[i].textContent.toLowerCase().indexOf(q)>=0?'':'none';
+    }
+  });
+  document.addEventListener('click',closeDd);
 
   function pick(id){
-    if(id==='advanced'&&!S.premium){post({type:'openUrl',url:'safoude://subscription'});return;}
+    if(PRO[id]&&!S.premium){post({type:'openUrl',url:'safoude://subscription'});return;}
     cur=id;
     if(location.hash!=='#'+id)location.hash=id;
     nav();body();
   }
-
   $('nav').addEventListener('click',function(e){var b=e.target.closest('.nav');if(b)pick(b.getAttribute('data-sec'));});
   window.addEventListener('hashchange',function(){var h=location.hash.replace('#','');if(h&&h!==cur&&ICONS[h])pick(h);});
   window.onState=function(){
-    if(cur==='advanced'&&!S.premium)cur='general';
+    if(PRO[cur]&&!S.premium)cur='general';
     nav();body();
   };
 
-  theme();i18n();
+  theme('settings');i18n();
   var h0=location.hash.replace('#','');
-  if(h0&&ICONS[h0]&&!(h0==='advanced'&&!S.premium))cur=h0;
+  if(h0&&ICONS[h0]&&!(PRO[h0]&&!S.premium))cur=h0;
   nav();body();
   post({type:'ready'});
 })();
@@ -3858,66 +4539,77 @@ if(H)H.addEventListener('message',function(e){var d=e.data;if(d&&d.type==='state
 <link rel=""icon"" href=""assets/app-icon.ico"">
 <meta name=""viewport"" content=""width=device-width, initial-scale=1"">
 <style>
-:root{--accent:#38bdf8;--accent2:#6366f1;--bg:#050b17;--card:rgba(14,24,44,.72);--stroke:rgba(140,190,255,.17);--text:#e9f2ff;--muted:#8ea6c6;--danger:#ff5d6c;--ok:#4ade80}
+:root{--accent:#5b9dff;--accent2:#5b9dff;--bg:#0e1013;--bg2:#12151a;--panel:#15181d;--card:rgb(21,24,29);--line:#262b33;--text:#e6e9ee;--muted:#8b94a1;--danger:#e05656;--ok:#6ec896;--rs:1;--barbg:linear-gradient(90deg,var(--accent),var(--accent2))}
 *{box-sizing:border-box;margin:0;padding:0}
 html,body{height:100%}
-body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--text);user-select:none;-webkit-user-select:none}
+body{font:14px/1.5 'Segoe UI',system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--text);user-select:none;-webkit-user-select:none;-webkit-font-smoothing:antialiased}
 button,input,select{font:inherit;color:inherit}
-button{cursor:pointer}
-.btn{height:38px;padding:0 18px;border-radius:12px;border:1px solid var(--stroke);background:rgba(255,255,255,.06);transition:background .15s,transform .1s}
-.btn:hover{background:rgba(255,255,255,.14)}
-.btn:active{transform:scale(.97)}
-.btn.primary{border:0;color:#03101f;font-weight:600;background:linear-gradient(120deg,var(--accent),var(--accent2))}
-.btn.primary:hover{filter:brightness(1.1);background:linear-gradient(120deg,var(--accent),var(--accent2))}
-.btn.sm{height:32px;padding:0 12px;border-radius:10px;font-size:13px}
-.btn.danger:hover{background:var(--danger);border-color:transparent;color:#fff}
-select,input[type=text]{height:40px;border-radius:12px;border:1px solid var(--stroke);background:rgba(10,20,40,.85);padding:0 12px;outline:0;user-select:text;-webkit-user-select:text}
-select:focus,input[type=text]:focus{border-color:var(--accent)}
-option{background:#0b1426}
-.sw{display:flex;align-items:center;justify-content:space-between;gap:16px;cursor:pointer;padding:7px 0}
+button{cursor:pointer;background:none;border:0}
+:focus-visible{outline:1px solid var(--accent);outline-offset:2px}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;height:34px;padding:0 16px;border:1px solid var(--line);border-radius:calc(4px * var(--rs));background:transparent;transition:background .12s,border-color .12s}
+.btn:hover{background:rgba(255,255,255,.06);border-color:#3b424d}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#0b0d10;font-weight:600}
+.btn.primary:hover{filter:brightness(1.08);background:var(--accent)}
+.btn.sm{height:28px;padding:0 10px;font-size:12.5px}
+.btn.danger:hover{background:var(--danger);border-color:var(--danger);color:#fff}
+input[type=text]{height:34px;border:1px solid var(--line);border-radius:calc(4px * var(--rs));background:rgba(0,0,0,.28);padding:0 10px;outline:0;user-select:text;-webkit-user-select:text}
+input[type=text]:focus{border-color:var(--accent)}
+.sw{display:flex;align-items:center;cursor:pointer}
 .sw input{display:none}
-.sw .t{position:relative;flex:none;width:44px;height:24px;border-radius:12px;background:rgba(255,255,255,.18);transition:background .2s}
-.sw .t::after{content:"""";position:absolute;left:3px;top:3px;width:18px;height:18px;border-radius:50%;background:#fff;transition:transform .2s}
+.sw .t{position:relative;flex:none;width:38px;height:20px;border-radius:calc(3px * var(--rs));background:#2b313a;transition:background .15s}
+.sw .t::after{content:"""";position:absolute;left:3px;top:3px;width:14px;height:14px;border-radius:calc(2px * var(--rs));background:#cdd3dc;transition:transform .15s}
 .sw input:checked+.t{background:var(--accent)}
-.sw input:checked+.t::after{transform:translateX(20px)}
-input[type=range]{width:100%;accent-color:var(--accent);cursor:pointer}
-::-webkit-scrollbar{width:10px}
-::-webkit-scrollbar-thumb{background:rgba(150,190,255,.25);border-radius:6px}
+.sw input:checked+.t::after{transform:translateX(18px);background:#fff}
+input[type=range]{accent-color:var(--accent);cursor:pointer}
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-thumb{background:#2c323b;border:2px solid transparent;background-clip:content-box}
 ::-webkit-scrollbar-track{background:transparent}
+.nosmooth *,.nosmooth *::before,.nosmooth *::after{transition:none!important;animation:none!important}
 
-body{background:radial-gradient(1000px 600px at 100% 0%,#0c2447 0%,transparent 60%),radial-gradient(900px 600px at 0% 100%,#141f55 0%,transparent 60%),#050b17;overflow-y:auto}
-.wrap{max-width:860px;margin:0 auto;padding:34px 28px 60px}
-.top{display:flex;align-items:center;gap:14px;margin-bottom:22px}
-.top img{width:34px;height:34px;border-radius:10px}
-.top h1{font-size:28px;font-weight:600;flex:1}
-.item{display:flex;align-items:center;gap:16px;padding:16px 18px;margin-bottom:12px;background:var(--card);border:1px solid var(--stroke);border-radius:18px;backdrop-filter:blur(14px);animation:in .3s both}
-@keyframes in{from{opacity:0;transform:translateY(8px)}}
-.fi{flex:none;width:46px;height:46px;border-radius:14px;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;letter-spacing:.5px;color:#03101f;background:linear-gradient(135deg,var(--accent),var(--accent2))}
-.inf{flex:1;min-width:0}
-.nm{font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.meta{font-size:12.5px;color:var(--muted);margin-top:3px}
-.meta.fail{color:var(--danger)}
-.bar{height:6px;border-radius:3px;background:rgba(255,255,255,.1);margin-top:9px;overflow:hidden}
-.bar i{display:block;height:100%;border-radius:3px;background:linear-gradient(90deg,var(--accent),var(--accent2));transition:width .3s}
-.bar.ind i{width:35%!important;animation:ind 1.2s ease-in-out infinite alternate}
-@keyframes ind{to{margin-left:65%}}
-.acts{display:flex;gap:8px;flex:none}
-.empty{text-align:center;color:var(--muted);padding:90px 0;font-size:16px}
-.empty svg{display:block;margin:0 auto 14px;width:56px;height:56px;fill:none;stroke:var(--muted);stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round;opacity:.7}
+body{overflow-y:auto}
+.wrap{max-width:980px;margin:0 auto;padding:30px 32px 60px}
+.top{display:flex;align-items:center;gap:14px;margin-bottom:20px}
+.top img{width:22px;height:22px}
+.top h1{flex:1;font-size:20px;font-weight:600}
+.thead,.item{display:grid;grid-template-columns:minmax(0,1fr) 200px 96px auto;gap:18px;align-items:center}
+.thead{padding:0 4px 8px;border-bottom:1px solid var(--line);color:var(--muted);font-size:12.5px}
+.item{padding:14px 4px;border-bottom:1px solid var(--line);background:var(--card)}
+body.compact .item{padding:8px 4px}
+.nm{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-weight:500}
+.src{color:var(--muted);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.st{font-size:13px}
+.st.fail{color:var(--danger)}
+.st.ok{color:var(--ok)}
+.bar{height:2px;margin-top:7px;background:var(--line);overflow:hidden}
+.bar i{display:block;height:100%;background:var(--barbg);transition:width .3s}
+.bar.ind i{width:30%!important;animation:ind 1.1s linear infinite alternate}
+@keyframes ind{to{margin-left:70%}}
+.sz{color:var(--muted);font-size:13px;font-variant-numeric:tabular-nums}
+.acts{display:flex;gap:6px;justify-content:flex-end}
+.empty{padding:80px 0;text-align:center;color:var(--muted)}
+.empty svg{display:block;margin:0 auto 12px;width:34px;height:34px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round}
+@media (max-width:760px){.thead{display:none}.item{grid-template-columns:minmax(0,1fr) auto}.sz{display:none}}
 </style>
 </head>
 <body>
 <div class=""wrap"">
   <div class=""top""><img src=""assets/app-icon.ico"" alt=""""><h1 data-i18n=""m_downloads""></h1><button class=""btn sm"" id=""clear"" data-i18n=""dl_clear""></button></div>
+  <div class=""thead"" id=""thead""><span data-i18n=""dl_col_file""></span><span data-i18n=""dl_col_status""></span><span data-i18n=""dl_col_size""></span><span></span></div>
   <div id=""list""></div>
 </div>
 <script>
 var H=window.chrome&&window.chrome.webview;
-var S=/*STATE*/null||{t:{},bookmarks:[],downloads:[],langs:[],engines:[],maxBm:10};
+var S=/*STATE*/null||{t:{},bookmarks:[],downloads:[],langs:[],engines:[],maxBm:10,ui:{}};
+var DEF={base:'',accent:'#5b9dff',accent2:'',smooth:true,radius:100,tabr:6,snow:false,snowCount:80,snowColor:'',aurora:false,clock24:true,searchBg:'',dlBar:'',dlCompact:false,cardOp:100,pbNewtab:'',pbSettings:'',pbDownloads:''};
 function T(k,a){var s=(S.t&&S.t[k])||k;if(a){for(var i=0;i<a.length;i++)s=s.split('{'+i+'}').join(a[i]);}return s;}
 function $(id){return document.getElementById(id);}
 function esc(s){return String(s==null?'':s).replace(/[&<>""']/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','""':'&quot;',""'"":'&#39;'}[c];});}
 function post(o){if(H)H.postMessage(o);}
+function U(k){return(S.premium&&S.ui&&S.ui[k]!==undefined)?S.ui[k]:DEF[k];}
+function hex2rgb(h){var m=/^#([0-9a-f]{6})$/i.exec(h||'');if(!m)return null;var n=parseInt(m[1],16);return[(n>>16)&255,(n>>8)&255,n&255];}
+function mix(a,b,t){return[Math.round(a[0]+(b[0]-a[0])*t),Math.round(a[1]+(b[1]-a[1])*t),Math.round(a[2]+(b[2]-a[2])*t)];}
+function rgb(c,a){return a===undefined?'rgb('+c.join(',')+')':'rgba('+c.join(',')+','+a+')';}
+function lum(c){return(0.299*c[0]+0.587*c[1]+0.114*c[2])/255;}
 function i18n(){
   document.documentElement.lang=S.lang||'en';
   var a=document.querySelectorAll('[data-i18n]'),i;
@@ -3927,39 +4619,64 @@ function i18n(){
   a=document.querySelectorAll('[data-tt]');
   for(i=0;i<a.length;i++)a[i].title=T(a[i].getAttribute('data-tt'));
 }
-function theme(){var r=document.documentElement.style;if(S.premium&&S.accent)r.setProperty('--accent',S.accent);else r.removeProperty('--accent');}
+function theme(kind){
+  var r=document.documentElement.style;
+  ['--accent','--accent2','--bg','--bg2','--panel','--card','--line','--text','--muted','--rs','--barbg','--search','--search-fg','--snowc'].forEach(function(p){r.removeProperty(p);});
+  var acc=hex2rgb(U('accent')),acc2=hex2rgb(U('accent2'));
+  if(S.premium&&acc)r.setProperty('--accent',U('accent'));
+  if(acc2)r.setProperty('--accent2',U('accent2'));else if(S.premium&&acc)r.setProperty('--accent2',U('accent'));
+  var pb=(kind==='newtab'?U('pbNewtab'):kind==='settings'?U('pbSettings'):kind==='downloads'?U('pbDownloads'):'')||U('base');
+  var b=hex2rgb(pb);
+  var panel=[21,24,29];
+  if(b){
+    var light=lum(b)>0.55,w=light?[0,0,0]:[255,255,255];
+    panel=mix(b,w,light?.04:.04);
+    r.setProperty('--bg',rgb(b));r.setProperty('--bg2',rgb(mix(b,w,.03)));r.setProperty('--panel',rgb(panel));
+    r.setProperty('--line',rgb(mix(b,w,light?.16:.12)));
+    if(light){r.setProperty('--text','#14181f');r.setProperty('--muted','#566070');}
+  }
+  r.setProperty('--card',rgb(panel,U('cardOp')/100));
+  r.setProperty('--rs',U('radius')/100);
+  if(hex2rgb(U('dlBar')))r.setProperty('--barbg',U('dlBar'));
+  var sb=hex2rgb(U('searchBg'));
+  if(sb){r.setProperty('--search',U('searchBg'));r.setProperty('--search-fg',lum(sb)>0.58?'#15191f':'#f1f4f8');}
+  if(hex2rgb(U('snowColor')))r.setProperty('--snowc',U('snowColor'));
+  document.body.classList.toggle('nosmooth',!U('smooth'));
+}
 function fmt(n){if(n==null||n<0)return'';var u=['B','KB','MB','GB','TB'],i=0;while(n>=1024&&i<4){n/=1024;i++;}return(i?n.toFixed(n<10?1:0):n)+' '+u[i];}
-if(H)H.addEventListener('message',function(e){var d=e.data;if(d&&d.type==='state'){S=d.state;theme();i18n();if(window.onState)window.onState();}});
+if(H)H.addEventListener('message',function(e){var d=e.data;if(d&&d.type==='state'){S=d.state;theme(window.PAGE);i18n();if(window.onState)window.onState();}});
 
+window.PAGE='downloads';
 (function(){
-  function ext(n){var m=/\.([A-Za-z0-9]{1,4})$/.exec(n||'');return m?m[1].toUpperCase():'FILE';}
+  function hostOf(u){try{return new URL(u).hostname;}catch(e){return'';}}
   function render(){
+    document.body.classList.toggle('compact',!!U('dlCompact'));
     var l=S.downloads||[],h='';
     if(!l.length){
       $('list').innerHTML='<div class=""empty""><svg viewBox=""0 0 24 24""><path d=""M12 4v11M7 11l5 5 5-5M5 20h14""/></svg>'+esc(T('dl_empty'))+'</div>';
-      $('clear').style.display='none';return;
+      $('clear').style.display='none';$('thead').style.display='none';return;
     }
-    $('clear').style.display='';
+    $('clear').style.display='';$('thead').style.display='';
     l.forEach(function(d){
       var pct=d.total>0?Math.min(100,Math.round(d.received*100/d.total)):0;
-      var st='',cls='meta',bar='',acts='';
+      var st='',cls='st',bar='',acts='',size=fmt(d.total>0?d.total:d.received);
       if(d.state==='progress'||d.state==='paused'){
-        st=T(d.state==='paused'?'dl_paused':'dl_progress')+' · '+fmt(d.received)+(d.total>0?' / '+fmt(d.total)+' ('+pct+'%)':'');
+        st=T(d.state==='paused'?'dl_paused':'dl_progress')+(d.total>0?' · '+pct+'%':'');
         bar='<div class=""bar'+(d.total>0?'':' ind')+'""><i style=""width:'+pct+'%""></i></div>';
         acts=(d.state==='paused'?'<button class=""btn sm"" data-a=""dlResume"" data-id=""'+d.id+'"">'+esc(T('dl_resume'))+'</button>':'<button class=""btn sm"" data-a=""dlPause"" data-id=""'+d.id+'"">'+esc(T('dl_pause'))+'</button>')+'<button class=""btn sm danger"" data-a=""dlCancel"" data-id=""'+d.id+'"">'+esc(T('dl_cancel'))+'</button>';
       }else{
-        if(d.state==='done'){st=T('dl_done')+' · '+fmt(d.received);acts='<button class=""btn sm primary"" data-a=""dlOpen"" data-id=""'+d.id+'"">'+esc(T('dl_open'))+'</button><button class=""btn sm"" data-a=""dlFolder"" data-id=""'+d.id+'"">'+esc(T('dl_folder'))+'</button>';}
+        if(d.state==='done'){st=T('dl_done');cls+=' ok';acts='<button class=""btn sm primary"" data-a=""dlOpen"" data-id=""'+d.id+'"">'+esc(T('dl_open'))+'</button><button class=""btn sm"" data-a=""dlFolder"" data-id=""'+d.id+'"">'+esc(T('dl_folder'))+'</button>';}
         else{st=T(d.state==='cancelled'?'dl_cancelled':'dl_failed');if(d.state!=='cancelled')cls+=' fail';}
         acts+='<button class=""btn sm danger"" data-a=""dlRemove"" data-id=""'+d.id+'"">'+esc(T('dl_remove'))+'</button>';
       }
-      h+='<div class=""item""><div class=""fi"">'+esc(ext(d.name))+'</div><div class=""inf""><div class=""nm"" title=""'+esc(d.url)+'"">'+esc(d.name)+'</div><div class=""'+cls+'"">'+esc(st)+'</div>'+bar+'</div><div class=""acts"">'+acts+'</div></div>';
+      h+='<div class=""item""><div><div class=""nm"" title=""'+esc(d.url)+'"">'+esc(d.name)+'</div><div class=""src"">'+esc(hostOf(d.url))+'</div></div><div><div class=""'+cls+'"">'+esc(st)+'</div>'+bar+'</div><div class=""sz"">'+esc(size)+'</div><div class=""acts"">'+acts+'</div></div>';
     });
     $('list').innerHTML=h;
   }
   $('list').addEventListener('click',function(e){var b=e.target.closest('button[data-a]');if(b)post({type:b.getAttribute('data-a'),id:+b.getAttribute('data-id')});});
   $('clear').addEventListener('click',function(){post({type:'dlClear'});});
-  window.onState=render;
-  theme();i18n();render();
+  window.onState=function(){render();};
+  theme('downloads');i18n();render();
   post({type:'ready'});
 })();
 </script>
@@ -3975,45 +4692,44 @@ if(H)H.addEventListener('message',function(e){var d=e.data;if(d&&d.type==='state
 <title data-i18n=""manageSubscription"">Manage Subscription</title>
 <link rel=""icon"" href=""assets/app-icon.ico"">
 <style>
-:root{--accent:#38bdf8;--accent2:#6366f1;--bg:#050b17;--card:rgba(14,24,44,.72);--stroke:rgba(140,190,255,.17);--text:#e9f2ff;--muted:#8ea6c6;--danger:#ff5d6c;--ok:#4ade80}
+:root{--accent:#5b9dff;--accent2:#5b9dff;--bg:#0e1013;--bg2:#12151a;--panel:#15181d;--card:rgb(21,24,29);--line:#262b33;--text:#e6e9ee;--muted:#8b94a1;--danger:#e05656;--ok:#6ec896;--rs:1;--barbg:linear-gradient(90deg,var(--accent),var(--accent2))}
 *{box-sizing:border-box;margin:0;padding:0}
 html,body{height:100%}
-body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--text);user-select:none;-webkit-user-select:none}
+body{font:14px/1.5 'Segoe UI',system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--text);user-select:none;-webkit-user-select:none;-webkit-font-smoothing:antialiased}
 button,input,select{font:inherit;color:inherit}
-button{cursor:pointer}
-.btn{height:38px;padding:0 18px;border-radius:12px;border:1px solid var(--stroke);background:rgba(255,255,255,.06);transition:background .15s,transform .1s}
-.btn:hover{background:rgba(255,255,255,.14)}
-.btn:active{transform:scale(.97)}
-.btn.primary{border:0;color:#03101f;font-weight:600;background:linear-gradient(120deg,var(--accent),var(--accent2))}
-.btn.primary:hover{filter:brightness(1.1);background:linear-gradient(120deg,var(--accent),var(--accent2))}
-.btn.sm{height:32px;padding:0 12px;border-radius:10px;font-size:13px}
-.btn.danger:hover{background:var(--danger);border-color:transparent;color:#fff}
-select,input[type=text]{height:40px;border-radius:12px;border:1px solid var(--stroke);background:rgba(10,20,40,.85);padding:0 12px;outline:0;user-select:text;-webkit-user-select:text}
-select:focus,input[type=text]:focus{border-color:var(--accent)}
-option{background:#0b1426}
-.sw{display:flex;align-items:center;justify-content:space-between;gap:16px;cursor:pointer;padding:7px 0}
+button{cursor:pointer;background:none;border:0}
+:focus-visible{outline:1px solid var(--accent);outline-offset:2px}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;height:34px;padding:0 16px;border:1px solid var(--line);border-radius:calc(4px * var(--rs));background:transparent;transition:background .12s,border-color .12s}
+.btn:hover{background:rgba(255,255,255,.06);border-color:#3b424d}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#0b0d10;font-weight:600}
+.btn.primary:hover{filter:brightness(1.08);background:var(--accent)}
+.btn.sm{height:28px;padding:0 10px;font-size:12.5px}
+.btn.danger:hover{background:var(--danger);border-color:var(--danger);color:#fff}
+input[type=text]{height:34px;border:1px solid var(--line);border-radius:calc(4px * var(--rs));background:rgba(0,0,0,.28);padding:0 10px;outline:0;user-select:text;-webkit-user-select:text}
+input[type=text]:focus{border-color:var(--accent)}
+.sw{display:flex;align-items:center;cursor:pointer}
 .sw input{display:none}
-.sw .t{position:relative;flex:none;width:44px;height:24px;border-radius:12px;background:rgba(255,255,255,.18);transition:background .2s}
-.sw .t::after{content:"""";position:absolute;left:3px;top:3px;width:18px;height:18px;border-radius:50%;background:#fff;transition:transform .2s}
+.sw .t{position:relative;flex:none;width:38px;height:20px;border-radius:calc(3px * var(--rs));background:#2b313a;transition:background .15s}
+.sw .t::after{content:"""";position:absolute;left:3px;top:3px;width:14px;height:14px;border-radius:calc(2px * var(--rs));background:#cdd3dc;transition:transform .15s}
 .sw input:checked+.t{background:var(--accent)}
-.sw input:checked+.t::after{transform:translateX(20px)}
-input[type=range]{width:100%;accent-color:var(--accent);cursor:pointer}
-::-webkit-scrollbar{width:10px}
-::-webkit-scrollbar-thumb{background:rgba(150,190,255,.25);border-radius:6px}
+.sw input:checked+.t::after{transform:translateX(18px);background:#fff}
+input[type=range]{accent-color:var(--accent);cursor:pointer}
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-thumb{background:#2c323b;border:2px solid transparent;background-clip:content-box}
 ::-webkit-scrollbar-track{background:transparent}
+.nosmooth *,.nosmooth *::before,.nosmooth *::after{transition:none!important;animation:none!important}
 
-body{display:flex;align-items:center;justify-content:center;min-height:100vh;background:radial-gradient(900px 600px at 50% 0%,#0d2c55 0%,transparent 65%),#050b17;overflow:auto}
-.stub-card{text-align:center;background:var(--card);border:1px solid var(--stroke);border-radius:20px;padding:44px 52px;max-width:460px;backdrop-filter:blur(16px);box-shadow:0 30px 80px rgba(0,0,0,.5);animation:in .4s both}
-@keyframes in{from{opacity:0;transform:translateY(14px) scale(.98)}}
-.stub-card svg{width:64px;height:64px;color:var(--accent);margin-bottom:20px;filter:drop-shadow(0 6px 18px rgba(56,189,248,.45))}
-.stub-card h1{font-size:1.5rem;font-weight:600;margin-bottom:12px;color:var(--text)}
-.stub-card p{font-size:.95rem;color:var(--muted);line-height:1.5}
-.perks{list-style:none;margin:22px 0 4px;text-align:left;display:inline-block}
-.perks li{padding:6px 0 6px 30px;position:relative;font-size:.95rem}
-.perks li::before{content:"""";position:absolute;left:4px;top:11px;width:14px;height:8px;border-left:2.5px solid var(--ok);border-bottom:2.5px solid var(--ok);transform:rotate(-45deg)}
-.btns{display:flex;gap:10px;justify-content:center;margin-top:26px}
-.btns .btn{min-width:120px;height:42px}
-.pill{display:inline-block;font-size:12px;padding:3px 12px;border-radius:12px;background:rgba(74,222,128,.16);color:var(--ok);font-weight:600;margin-top:16px}
+body{display:flex;align-items:center;justify-content:center;min-height:100vh;overflow:auto}
+.stub-card{text-align:left;background:var(--panel);border:1px solid var(--line);border-radius:calc(4px * var(--rs));padding:34px 38px;width:min(480px,92vw)}
+.stub-card svg{width:34px;height:34px;color:var(--accent);margin-bottom:18px}
+.stub-card h1{font-size:20px;font-weight:600;margin-bottom:8px;color:var(--text)}
+.stub-card p{font-size:14px;color:var(--muted);line-height:1.55}
+.perks{list-style:none;margin:22px 0 4px;border-top:1px solid var(--line)}
+.perks li{padding:10px 0 10px 26px;position:relative;border-bottom:1px solid var(--line)}
+.perks li::before{content:"""";position:absolute;left:3px;top:15px;width:11px;height:6px;border-left:2px solid var(--ok);border-bottom:2px solid var(--ok);transform:rotate(-45deg)}
+.btns{display:flex;gap:8px;margin-top:24px}
+.btns .btn{min-width:110px;height:38px}
+.pill{display:inline-block;font-size:12px;padding:1px 8px;border:1px solid var(--ok);color:var(--ok);border-radius:calc(3px * var(--rs));margin-top:16px}
 </style>
 </head>
 <body class=""od4-left-nav-mode"">
@@ -4021,17 +4737,23 @@ body{display:flex;align-items:center;justify-content:center;min-height:100vh;bac
   <svg aria-hidden=""true"" xmlns=""http://www.w3.org/2000/svg"" fill=""none"" viewBox=""0 0 24 24"" stroke-width=""1.5"" stroke=""currentColor""><path stroke-linecap=""round"" stroke-linejoin=""round"" d=""M11.48 3.499a.562.562 0 0 1 1.04 0l2.125 5.111a.563.563 0 0 0 .475.345l5.518.442c.499.04.701.663.321.988l-4.204 3.602a.563.563 0 0 0-.182.557l1.285 5.385a.562.562 0 0 1-.84.61l-4.725-2.885a.562.562 0 0 0-.586 0L6.982 20.54a.562.562 0 0 1-.84-.61l1.285-5.386a.562.562 0 0 0-.182-.557l-4.204-3.602a.562.562 0 0 1 .321-.988l5.518-.442a.563.563 0 0 0 .475-.345L11.48 3.5Z""/></svg>
   <h1 data-i18n=""manageSubscription"">Manage Subscription</h1>
   <p data-i18n=""subscriptionBody"">Subscription management is coming soon. Stay tuned for premium features.</p>
-  <ul class=""perks""><li id=""p1""></li><li id=""p2""></li><li id=""p3""></li></ul>
+  <ul class=""perks""><li id=""p1""></li><li id=""p2""></li><li id=""p3""></li><li id=""p4""></li></ul>
   <div id=""st""></div>
   <div class=""btns""><button class=""btn"" id=""back"" data-i18n=""sub_back""></button><button class=""btn primary"" id=""buy"" data-i18n=""sub_buy""></button></div>
 </div>
 <script>
 var H=window.chrome&&window.chrome.webview;
-var S=/*STATE*/null||{t:{},bookmarks:[],downloads:[],langs:[],engines:[],maxBm:10};
+var S=/*STATE*/null||{t:{},bookmarks:[],downloads:[],langs:[],engines:[],maxBm:10,ui:{}};
+var DEF={base:'',accent:'#5b9dff',accent2:'',smooth:true,radius:100,tabr:6,snow:false,snowCount:80,snowColor:'',aurora:false,clock24:true,searchBg:'',dlBar:'',dlCompact:false,cardOp:100,pbNewtab:'',pbSettings:'',pbDownloads:''};
 function T(k,a){var s=(S.t&&S.t[k])||k;if(a){for(var i=0;i<a.length;i++)s=s.split('{'+i+'}').join(a[i]);}return s;}
 function $(id){return document.getElementById(id);}
 function esc(s){return String(s==null?'':s).replace(/[&<>""']/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','""':'&quot;',""'"":'&#39;'}[c];});}
 function post(o){if(H)H.postMessage(o);}
+function U(k){return(S.premium&&S.ui&&S.ui[k]!==undefined)?S.ui[k]:DEF[k];}
+function hex2rgb(h){var m=/^#([0-9a-f]{6})$/i.exec(h||'');if(!m)return null;var n=parseInt(m[1],16);return[(n>>16)&255,(n>>8)&255,n&255];}
+function mix(a,b,t){return[Math.round(a[0]+(b[0]-a[0])*t),Math.round(a[1]+(b[1]-a[1])*t),Math.round(a[2]+(b[2]-a[2])*t)];}
+function rgb(c,a){return a===undefined?'rgb('+c.join(',')+')':'rgba('+c.join(',')+','+a+')';}
+function lum(c){return(0.299*c[0]+0.587*c[1]+0.114*c[2])/255;}
 function i18n(){
   document.documentElement.lang=S.lang||'en';
   var a=document.querySelectorAll('[data-i18n]'),i;
@@ -4041,20 +4763,44 @@ function i18n(){
   a=document.querySelectorAll('[data-tt]');
   for(i=0;i<a.length;i++)a[i].title=T(a[i].getAttribute('data-tt'));
 }
-function theme(){var r=document.documentElement.style;if(S.premium&&S.accent)r.setProperty('--accent',S.accent);else r.removeProperty('--accent');}
+function theme(kind){
+  var r=document.documentElement.style;
+  ['--accent','--accent2','--bg','--bg2','--panel','--card','--line','--text','--muted','--rs','--barbg','--search','--search-fg','--snowc'].forEach(function(p){r.removeProperty(p);});
+  var acc=hex2rgb(U('accent')),acc2=hex2rgb(U('accent2'));
+  if(S.premium&&acc)r.setProperty('--accent',U('accent'));
+  if(acc2)r.setProperty('--accent2',U('accent2'));else if(S.premium&&acc)r.setProperty('--accent2',U('accent'));
+  var pb=(kind==='newtab'?U('pbNewtab'):kind==='settings'?U('pbSettings'):kind==='downloads'?U('pbDownloads'):'')||U('base');
+  var b=hex2rgb(pb);
+  var panel=[21,24,29];
+  if(b){
+    var light=lum(b)>0.55,w=light?[0,0,0]:[255,255,255];
+    panel=mix(b,w,light?.04:.04);
+    r.setProperty('--bg',rgb(b));r.setProperty('--bg2',rgb(mix(b,w,.03)));r.setProperty('--panel',rgb(panel));
+    r.setProperty('--line',rgb(mix(b,w,light?.16:.12)));
+    if(light){r.setProperty('--text','#14181f');r.setProperty('--muted','#566070');}
+  }
+  r.setProperty('--card',rgb(panel,U('cardOp')/100));
+  r.setProperty('--rs',U('radius')/100);
+  if(hex2rgb(U('dlBar')))r.setProperty('--barbg',U('dlBar'));
+  var sb=hex2rgb(U('searchBg'));
+  if(sb){r.setProperty('--search',U('searchBg'));r.setProperty('--search-fg',lum(sb)>0.58?'#15191f':'#f1f4f8');}
+  if(hex2rgb(U('snowColor')))r.setProperty('--snowc',U('snowColor'));
+  document.body.classList.toggle('nosmooth',!U('smooth'));
+}
 function fmt(n){if(n==null||n<0)return'';var u=['B','KB','MB','GB','TB'],i=0;while(n>=1024&&i<4){n/=1024;i++;}return(i?n.toFixed(n<10?1:0):n)+' '+u[i];}
-if(H)H.addEventListener('message',function(e){var d=e.data;if(d&&d.type==='state'){S=d.state;theme();i18n();if(window.onState)window.onState();}});
+if(H)H.addEventListener('message',function(e){var d=e.data;if(d&&d.type==='state'){S=d.state;theme(window.PAGE);i18n();if(window.onState)window.onState();}});
 
+window.PAGE='subscription';
 (function(){
   function render(){
-    $('p1').textContent=T('sub_perk1',[40]);$('p2').textContent=T('sub_perk2');$('p3').textContent=T('sub_perk3');
+    $('p1').textContent=T('sub_perk1',[40]);$('p2').textContent=T('sub_perk2');$('p3').textContent=T('sub_perk3');$('p4').textContent=T('sub_perk4');
     $('buy').style.display=S.premium?'none':'';
     $('st').innerHTML=S.premium?'<span class=""pill"">'+esc(T('adv_active'))+'</span>':'';
   }
   $('back').addEventListener('click',function(){post({type:'openUrl',url:'safoude://settings'});});
   $('buy').addEventListener('click',function(){post({type:'buy'});});
   window.onState=render;
-  theme();i18n();render();
+  theme('subscription');i18n();render();
   post({type:'ready'});
 })();
 </script>
@@ -4149,7 +4895,44 @@ if(H)H.addEventListener('message',function(e){var d=e.data;if(d&&d.type==='state
 ""sub_perk1"": ""Up to {0} bookmarks"",
 ""sub_perk2"": ""Custom accent color"",
 ""sub_perk3"": ""Wallpaper blur and dimming"",
-""del"": ""Delete""
+""del"": ""Delete"",
+""sec_max"": ""Maximum customization"",
+""max_desc"": ""Change the look of any menu and page of the browser. Every color accepts a HEX value."",
+""grp_all"": ""Whole browser"",
+""grp_win"": ""Browser window"",
+""grp_nt"": ""New tab"",
+""grp_dl"": ""Downloads"",
+""grp_set"": ""Settings page"",
+""c_base"": ""Interface color"",
+""c_accent2"": ""Second accent color"",
+""c_smooth"": ""Smoothing (anti-aliasing and smooth animations)"",
+""c_radius"": ""Corner roundness"",
+""c_tabr"": ""Tab corner radius"",
+""c_snow"": ""Snowflakes"",
+""c_snowcount"": ""Snowflake count"",
+""c_snowcol"": ""Snowflake color"",
+""c_aurora"": ""Animated glow in the background"",
+""c_clock24"": ""24-hour clock"",
+""c_search"": ""Search bar color"",
+""c_bar"": ""Progress bar color"",
+""c_compact"": ""Compact list"",
+""c_pagebase"": ""Page background color"",
+""c_cardop"": ""Card opacity"",
+""c_reset"": ""Reset all customization"",
+""c_default"": ""Default"",
+""ph_search"": ""Search…"",
+""sub_perk4"": ""Maximum customization of every menu"",
+""m_logs"": ""Open logs folder"",
+""n_dl_done"": ""Download completed: {0}"",
+""n_tray"": ""Safoude keeps running in the tray."",
+""close_tray"": ""Hide to the tray when the window is closed"",
+""logs_on"": ""Write log files"",
+""logs_dir"": ""Log folder"",
+""dl_col_file"": ""File"",
+""dl_col_status"": ""Status"",
+""dl_col_size"": ""Size"",
+""grp_behavior"": ""Behavior"",
+""grp_region"": ""Language and region""
 },
 ""ru"": {
 ""_name"": ""Русский"",
@@ -4237,7 +5020,44 @@ if(H)H.addEventListener('message',function(e){var d=e.data;if(d&&d.type==='state
 ""sub_perk1"": ""До {0} закладок"",
 ""sub_perk2"": ""Свой цвет акцента"",
 ""sub_perk3"": ""Размытие и затемнение обоев"",
-""del"": ""Удалить""
+""del"": ""Удалить"",
+""sec_max"": ""Максимальная кастомизация"",
+""max_desc"": ""Меняй вид любого меню и страницы браузера. Любой цвет принимает значение HEX."",
+""grp_all"": ""Весь браузер"",
+""grp_win"": ""Окно браузера"",
+""grp_nt"": ""Новая вкладка"",
+""grp_dl"": ""Загрузки"",
+""grp_set"": ""Страница настроек"",
+""c_base"": ""Цвет интерфейса"",
+""c_accent2"": ""Второй цвет акцента"",
+""c_smooth"": ""Сглаживание (антиалиасинг и плавные анимации)"",
+""c_radius"": ""Скругление углов"",
+""c_tabr"": ""Скругление вкладок"",
+""c_snow"": ""Снежинки"",
+""c_snowcount"": ""Количество снежинок"",
+""c_snowcol"": ""Цвет снежинок"",
+""c_aurora"": ""Анимированное свечение на фоне"",
+""c_clock24"": ""24-часовые часы"",
+""c_search"": ""Цвет строки поиска"",
+""c_bar"": ""Цвет полосы загрузки"",
+""c_compact"": ""Компактный список"",
+""c_pagebase"": ""Цвет фона страницы"",
+""c_cardop"": ""Непрозрачность карточек"",
+""c_reset"": ""Сбросить всю кастомизацию"",
+""c_default"": ""По умолчанию"",
+""ph_search"": ""Поиск…"",
+""sub_perk4"": ""Максимальная кастомизация любого меню"",
+""m_logs"": ""Открыть папку с логами"",
+""n_dl_done"": ""Загрузка завершена: {0}"",
+""n_tray"": ""Safoude продолжает работать в трее."",
+""close_tray"": ""Скрывать в трей при закрытии окна"",
+""logs_on"": ""Вести лог-файлы"",
+""logs_dir"": ""Папка с логами"",
+""dl_col_file"": ""Файл"",
+""dl_col_status"": ""Состояние"",
+""dl_col_size"": ""Размер"",
+""grp_behavior"": ""Поведение"",
+""grp_region"": ""Язык и регион""
 },
 ""uk"": {
 ""_name"": ""Українська"",
@@ -4325,7 +5145,44 @@ if(H)H.addEventListener('message',function(e){var d=e.data;if(d&&d.type==='state
 ""sub_perk1"": ""До {0} закладок"",
 ""sub_perk2"": ""Власний колір акценту"",
 ""sub_perk3"": ""Розмиття й затемнення шпалер"",
-""del"": ""Видалити""
+""del"": ""Видалити"",
+""sec_max"": ""Максимальна кастомізація"",
+""max_desc"": ""Змінюй вигляд будь-якого меню й сторінки браузера. Будь-який колір приймає значення HEX."",
+""grp_all"": ""Весь браузер"",
+""grp_win"": ""Вікно браузера"",
+""grp_nt"": ""Нова вкладка"",
+""grp_dl"": ""Завантаження"",
+""grp_set"": ""Сторінка налаштувань"",
+""c_base"": ""Колір інтерфейсу"",
+""c_accent2"": ""Другий колір акценту"",
+""c_smooth"": ""Згладжування (антиаліасинг і плавні анімації)"",
+""c_radius"": ""Заокруглення кутів"",
+""c_tabr"": ""Заокруглення вкладок"",
+""c_snow"": ""Сніжинки"",
+""c_snowcount"": ""Кількість сніжинок"",
+""c_snowcol"": ""Колір сніжинок"",
+""c_aurora"": ""Анімоване сяйво на тлі"",
+""c_clock24"": ""24-годинний годинник"",
+""c_search"": ""Колір рядка пошуку"",
+""c_bar"": ""Колір смуги завантаження"",
+""c_compact"": ""Компактний список"",
+""c_pagebase"": ""Колір тла сторінки"",
+""c_cardop"": ""Непрозорість карток"",
+""c_reset"": ""Скинути всю кастомізацію"",
+""c_default"": ""Типово"",
+""ph_search"": ""Пошук…"",
+""sub_perk4"": ""Максимальна кастомізація будь-якого меню"",
+""m_logs"": ""Відкрити теку з логами"",
+""n_dl_done"": ""Завантаження завершено: {0}"",
+""n_tray"": ""Safoude продовжує працювати в треї."",
+""close_tray"": ""Ховати в трей під час закриття вікна"",
+""logs_on"": ""Вести лог-файли"",
+""logs_dir"": ""Тека з логами"",
+""dl_col_file"": ""Файл"",
+""dl_col_status"": ""Стан"",
+""dl_col_size"": ""Розмір"",
+""grp_behavior"": ""Поведінка"",
+""grp_region"": ""Мова й регіон""
 },
 ""de"": {
 ""_name"": ""Deutsch"",
@@ -4413,7 +5270,44 @@ if(H)H.addEventListener('message',function(e){var d=e.data;if(d&&d.type==='state
 ""sub_perk1"": ""Bis zu {0} Lesezeichen"",
 ""sub_perk2"": ""Eigene Akzentfarbe"",
 ""sub_perk3"": ""Hintergrund-Unschärfe und -Abdunklung"",
-""del"": ""Löschen""
+""del"": ""Löschen"",
+""sec_max"": ""Maximale Anpassung"",
+""max_desc"": ""Ändere das Aussehen jedes Menüs und jeder Seite des Browsers. Jede Farbe akzeptiert einen HEX-Wert."",
+""grp_all"": ""Ganzer Browser"",
+""grp_win"": ""Browserfenster"",
+""grp_nt"": ""Neuer Tab"",
+""grp_dl"": ""Downloads"",
+""grp_set"": ""Einstellungsseite"",
+""c_base"": ""Oberflächenfarbe"",
+""c_accent2"": ""Zweite Akzentfarbe"",
+""c_smooth"": ""Glättung (Kantenglättung und flüssige Animationen)"",
+""c_radius"": ""Eckenrundung"",
+""c_tabr"": ""Eckenradius der Tabs"",
+""c_snow"": ""Schneeflocken"",
+""c_snowcount"": ""Anzahl der Schneeflocken"",
+""c_snowcol"": ""Farbe der Schneeflocken"",
+""c_aurora"": ""Animiertes Leuchten im Hintergrund"",
+""c_clock24"": ""24-Stunden-Uhr"",
+""c_search"": ""Farbe der Suchleiste"",
+""c_bar"": ""Farbe des Fortschrittsbalkens"",
+""c_compact"": ""Kompakte Liste"",
+""c_pagebase"": ""Hintergrundfarbe der Seite"",
+""c_cardop"": ""Deckkraft der Karten"",
+""c_reset"": ""Alle Anpassungen zurücksetzen"",
+""c_default"": ""Standard"",
+""ph_search"": ""Suchen…"",
+""sub_perk4"": ""Maximale Anpassung jedes Menüs"",
+""m_logs"": ""Protokollordner öffnen"",
+""n_dl_done"": ""Download abgeschlossen: {0}"",
+""n_tray"": ""Safoude läuft im Tray weiter."",
+""close_tray"": ""Beim Schließen des Fensters in den Tray ausblenden"",
+""logs_on"": ""Protokolldateien schreiben"",
+""logs_dir"": ""Protokollordner"",
+""dl_col_file"": ""Datei"",
+""dl_col_status"": ""Status"",
+""dl_col_size"": ""Größe"",
+""grp_behavior"": ""Verhalten"",
+""grp_region"": ""Sprache und Region""
 },
 ""fr"": {
 ""_name"": ""Français"",
@@ -4501,7 +5395,44 @@ if(H)H.addEventListener('message',function(e){var d=e.data;if(d&&d.type==='state
 ""sub_perk1"": ""Jusqu'à {0} favoris"",
 ""sub_perk2"": ""Couleur d'accent personnalisée"",
 ""sub_perk3"": ""Flou et assombrissement du fond"",
-""del"": ""Supprimer""
+""del"": ""Supprimer"",
+""sec_max"": ""Personnalisation maximale"",
+""max_desc"": ""Modifie l'apparence de n'importe quel menu et page du navigateur. Chaque couleur accepte une valeur HEX."",
+""grp_all"": ""Tout le navigateur"",
+""grp_win"": ""Fenêtre du navigateur"",
+""grp_nt"": ""Nouvel onglet"",
+""grp_dl"": ""Téléchargements"",
+""grp_set"": ""Page des réglages"",
+""c_base"": ""Couleur de l'interface"",
+""c_accent2"": ""Seconde couleur d'accent"",
+""c_smooth"": ""Lissage (anticrénelage et animations fluides)"",
+""c_radius"": ""Arrondi des coins"",
+""c_tabr"": ""Rayon des coins des onglets"",
+""c_snow"": ""Flocons de neige"",
+""c_snowcount"": ""Nombre de flocons"",
+""c_snowcol"": ""Couleur des flocons"",
+""c_aurora"": ""Lueur animée en arrière-plan"",
+""c_clock24"": ""Horloge 24 heures"",
+""c_search"": ""Couleur de la barre de recherche"",
+""c_bar"": ""Couleur de la barre de progression"",
+""c_compact"": ""Liste compacte"",
+""c_pagebase"": ""Couleur de fond de la page"",
+""c_cardop"": ""Opacité des cartes"",
+""c_reset"": ""Réinitialiser toute la personnalisation"",
+""c_default"": ""Par défaut"",
+""ph_search"": ""Rechercher…"",
+""sub_perk4"": ""Personnalisation maximale de chaque menu"",
+""m_logs"": ""Ouvrir le dossier des journaux"",
+""n_dl_done"": ""Téléchargement terminé : {0}"",
+""n_tray"": ""Safoude continue de fonctionner dans la zone de notification."",
+""close_tray"": ""Réduire dans la zone de notification à la fermeture de la fenêtre"",
+""logs_on"": ""Écrire des fichiers journaux"",
+""logs_dir"": ""Dossier des journaux"",
+""dl_col_file"": ""Fichier"",
+""dl_col_status"": ""État"",
+""dl_col_size"": ""Taille"",
+""grp_behavior"": ""Comportement"",
+""grp_region"": ""Langue et région""
 },
 ""es"": {
 ""_name"": ""Español"",
@@ -4589,7 +5520,44 @@ if(H)H.addEventListener('message',function(e){var d=e.data;if(d&&d.type==='state
 ""sub_perk1"": ""Hasta {0} marcadores"",
 ""sub_perk2"": ""Color de acento propio"",
 ""sub_perk3"": ""Desenfoque y oscurecimiento del fondo"",
-""del"": ""Eliminar""
+""del"": ""Eliminar"",
+""sec_max"": ""Personalización máxima"",
+""max_desc"": ""Cambia el aspecto de cualquier menú y página del navegador. Cada color acepta un valor HEX."",
+""grp_all"": ""Todo el navegador"",
+""grp_win"": ""Ventana del navegador"",
+""grp_nt"": ""Nueva pestaña"",
+""grp_dl"": ""Descargas"",
+""grp_set"": ""Página de ajustes"",
+""c_base"": ""Color de la interfaz"",
+""c_accent2"": ""Segundo color de acento"",
+""c_smooth"": ""Suavizado (antialiasing y animaciones fluidas)"",
+""c_radius"": ""Redondeo de esquinas"",
+""c_tabr"": ""Radio de esquinas de las pestañas"",
+""c_snow"": ""Copos de nieve"",
+""c_snowcount"": ""Cantidad de copos"",
+""c_snowcol"": ""Color de los copos"",
+""c_aurora"": ""Resplandor animado de fondo"",
+""c_clock24"": ""Reloj de 24 horas"",
+""c_search"": ""Color de la barra de búsqueda"",
+""c_bar"": ""Color de la barra de progreso"",
+""c_compact"": ""Lista compacta"",
+""c_pagebase"": ""Color de fondo de la página"",
+""c_cardop"": ""Opacidad de las tarjetas"",
+""c_reset"": ""Restablecer toda la personalización"",
+""c_default"": ""Por defecto"",
+""ph_search"": ""Buscar…"",
+""sub_perk4"": ""Personalización máxima de cada menú"",
+""m_logs"": ""Abrir la carpeta de registros"",
+""n_dl_done"": ""Descarga completada: {0}"",
+""n_tray"": ""Safoude sigue funcionando en la bandeja."",
+""close_tray"": ""Ocultar en la bandeja al cerrar la ventana"",
+""logs_on"": ""Escribir archivos de registro"",
+""logs_dir"": ""Carpeta de registros"",
+""dl_col_file"": ""Archivo"",
+""dl_col_status"": ""Estado"",
+""dl_col_size"": ""Tamaño"",
+""grp_behavior"": ""Comportamiento"",
+""grp_region"": ""Idioma y región""
 },
 ""it"": {
 ""_name"": ""Italiano"",
@@ -4677,7 +5645,44 @@ if(H)H.addEventListener('message',function(e){var d=e.data;if(d&&d.type==='state
 ""sub_perk1"": ""Fino a {0} segnalibri"",
 ""sub_perk2"": ""Colore di accento personalizzato"",
 ""sub_perk3"": ""Sfocatura e oscuramento dello sfondo"",
-""del"": ""Elimina""
+""del"": ""Elimina"",
+""sec_max"": ""Personalizzazione massima"",
+""max_desc"": ""Cambia l'aspetto di qualsiasi menu e pagina del browser. Ogni colore accetta un valore HEX."",
+""grp_all"": ""Tutto il browser"",
+""grp_win"": ""Finestra del browser"",
+""grp_nt"": ""Nuova scheda"",
+""grp_dl"": ""Download"",
+""grp_set"": ""Pagina delle impostazioni"",
+""c_base"": ""Colore dell'interfaccia"",
+""c_accent2"": ""Secondo colore di accento"",
+""c_smooth"": ""Smussatura (antialiasing e animazioni fluide)"",
+""c_radius"": ""Arrotondamento degli angoli"",
+""c_tabr"": ""Raggio degli angoli delle schede"",
+""c_snow"": ""Fiocchi di neve"",
+""c_snowcount"": ""Numero di fiocchi"",
+""c_snowcol"": ""Colore dei fiocchi"",
+""c_aurora"": ""Bagliore animato sullo sfondo"",
+""c_clock24"": ""Orologio a 24 ore"",
+""c_search"": ""Colore della barra di ricerca"",
+""c_bar"": ""Colore della barra di avanzamento"",
+""c_compact"": ""Elenco compatto"",
+""c_pagebase"": ""Colore di sfondo della pagina"",
+""c_cardop"": ""Opacità delle schede"",
+""c_reset"": ""Ripristina tutta la personalizzazione"",
+""c_default"": ""Predefinito"",
+""ph_search"": ""Cerca…"",
+""sub_perk4"": ""Personalizzazione massima di ogni menu"",
+""m_logs"": ""Apri la cartella dei log"",
+""n_dl_done"": ""Download completato: {0}"",
+""n_tray"": ""Safoude continua a funzionare nella barra di sistema."",
+""close_tray"": ""Nascondi nella barra di sistema alla chiusura della finestra"",
+""logs_on"": ""Scrivi file di log"",
+""logs_dir"": ""Cartella dei log"",
+""dl_col_file"": ""File"",
+""dl_col_status"": ""Stato"",
+""dl_col_size"": ""Dimensione"",
+""grp_behavior"": ""Comportamento"",
+""grp_region"": ""Lingua e regione""
 },
 ""pt"": {
 ""_name"": ""Português"",
@@ -4765,7 +5770,44 @@ if(H)H.addEventListener('message',function(e){var d=e.data;if(d&&d.type==='state
 ""sub_perk1"": ""Até {0} favoritos"",
 ""sub_perk2"": ""Cor de destaque própria"",
 ""sub_perk3"": ""Desfoque e escurecimento do plano de fundo"",
-""del"": ""Excluir""
+""del"": ""Excluir"",
+""sec_max"": ""Personalização máxima"",
+""max_desc"": ""Mude a aparência de qualquer menu e página do navegador. Cada cor aceita um valor HEX."",
+""grp_all"": ""Todo o navegador"",
+""grp_win"": ""Janela do navegador"",
+""grp_nt"": ""Nova guia"",
+""grp_dl"": ""Downloads"",
+""grp_set"": ""Página de configurações"",
+""c_base"": ""Cor da interface"",
+""c_accent2"": ""Segunda cor de destaque"",
+""c_smooth"": ""Suavização (antialiasing e animações fluidas)"",
+""c_radius"": ""Arredondamento dos cantos"",
+""c_tabr"": ""Raio dos cantos das guias"",
+""c_snow"": ""Flocos de neve"",
+""c_snowcount"": ""Quantidade de flocos"",
+""c_snowcol"": ""Cor dos flocos"",
+""c_aurora"": ""Brilho animado no fundo"",
+""c_clock24"": ""Relógio de 24 horas"",
+""c_search"": ""Cor da barra de pesquisa"",
+""c_bar"": ""Cor da barra de progresso"",
+""c_compact"": ""Lista compacta"",
+""c_pagebase"": ""Cor de fundo da página"",
+""c_cardop"": ""Opacidade dos cartões"",
+""c_reset"": ""Redefinir toda a personalização"",
+""c_default"": ""Padrão"",
+""ph_search"": ""Pesquisar…"",
+""sub_perk4"": ""Personalização máxima de cada menu"",
+""m_logs"": ""Abrir a pasta de logs"",
+""n_dl_done"": ""Download concluído: {0}"",
+""n_tray"": ""O Safoude continua em execução na bandeja."",
+""close_tray"": ""Ocultar na bandeja ao fechar a janela"",
+""logs_on"": ""Gravar arquivos de log"",
+""logs_dir"": ""Pasta de logs"",
+""dl_col_file"": ""Arquivo"",
+""dl_col_status"": ""Estado"",
+""dl_col_size"": ""Tamanho"",
+""grp_behavior"": ""Comportamento"",
+""grp_region"": ""Idioma e região""
 },
 ""tr"": {
 ""_name"": ""Türkçe"",
@@ -4853,7 +5895,44 @@ if(H)H.addEventListener('message',function(e){var d=e.data;if(d&&d.type==='state
 ""sub_perk1"": ""{0} yer imine kadar"",
 ""sub_perk2"": ""Özel vurgu rengi"",
 ""sub_perk3"": ""Duvar kağıdı bulanıklığı ve karartma"",
-""del"": ""Sil""
+""del"": ""Sil"",
+""sec_max"": ""Maksimum özelleştirme"",
+""max_desc"": ""Tarayıcının her menüsünün ve sayfasının görünümünü değiştir. Her renk bir HEX değeri kabul eder."",
+""grp_all"": ""Tüm tarayıcı"",
+""grp_win"": ""Tarayıcı penceresi"",
+""grp_nt"": ""Yeni sekme"",
+""grp_dl"": ""İndirmeler"",
+""grp_set"": ""Ayarlar sayfası"",
+""c_base"": ""Arayüz rengi"",
+""c_accent2"": ""İkinci vurgu rengi"",
+""c_smooth"": ""Yumuşatma (kenar yumuşatma ve akıcı animasyonlar)"",
+""c_radius"": ""Köşe yuvarlaklığı"",
+""c_tabr"": ""Sekme köşe yarıçapı"",
+""c_snow"": ""Kar taneleri"",
+""c_snowcount"": ""Kar tanesi sayısı"",
+""c_snowcol"": ""Kar tanesi rengi"",
+""c_aurora"": ""Arka planda animasyonlu parıltı"",
+""c_clock24"": ""24 saatlik saat"",
+""c_search"": ""Arama çubuğu rengi"",
+""c_bar"": ""İlerleme çubuğu rengi"",
+""c_compact"": ""Sıkışık liste"",
+""c_pagebase"": ""Sayfa arka plan rengi"",
+""c_cardop"": ""Kart opaklığı"",
+""c_reset"": ""Tüm özelleştirmeyi sıfırla"",
+""c_default"": ""Varsayılan"",
+""ph_search"": ""Ara…"",
+""sub_perk4"": ""Her menünün maksimum özelleştirmesi"",
+""m_logs"": ""Günlük klasörünü aç"",
+""n_dl_done"": ""İndirme tamamlandı: {0}"",
+""n_tray"": ""Safoude tepside çalışmaya devam ediyor."",
+""close_tray"": ""Pencere kapatılınca tepsiye gizle"",
+""logs_on"": ""Günlük dosyaları yaz"",
+""logs_dir"": ""Günlük klasörü"",
+""dl_col_file"": ""Dosya"",
+""dl_col_status"": ""Durum"",
+""dl_col_size"": ""Boyut"",
+""grp_behavior"": ""Davranış"",
+""grp_region"": ""Dil ve bölge""
 },
 ""zh"": {
 ""_name"": ""中文（简体）"",
@@ -4941,7 +6020,44 @@ if(H)H.addEventListener('message',function(e){var d=e.data;if(d&&d.type==='state
 ""sub_perk1"": ""最多 {0} 个书签"",
 ""sub_perk2"": ""自定义强调色"",
 ""sub_perk3"": ""壁纸模糊与变暗"",
-""del"": ""删除""
+""del"": ""删除"",
+""sec_max"": ""最大自定义"",
+""max_desc"": ""更改浏览器任意菜单和页面的外观。每种颜色都接受 HEX 值。"",
+""grp_all"": ""整个浏览器"",
+""grp_win"": ""浏览器窗口"",
+""grp_nt"": ""新标签页"",
+""grp_dl"": ""下载"",
+""grp_set"": ""设置页面"",
+""c_base"": ""界面颜色"",
+""c_accent2"": ""第二强调色"",
+""c_smooth"": ""平滑（抗锯齿和流畅动画）"",
+""c_radius"": ""圆角程度"",
+""c_tabr"": ""标签页圆角半径"",
+""c_snow"": ""雪花"",
+""c_snowcount"": ""雪花数量"",
+""c_snowcol"": ""雪花颜色"",
+""c_aurora"": ""背景动态光晕"",
+""c_clock24"": ""24 小时制时钟"",
+""c_search"": ""搜索栏颜色"",
+""c_bar"": ""进度条颜色"",
+""c_compact"": ""紧凑列表"",
+""c_pagebase"": ""页面背景颜色"",
+""c_cardop"": ""卡片不透明度"",
+""c_reset"": ""重置全部自定义"",
+""c_default"": ""默认"",
+""ph_search"": ""搜索…"",
+""sub_perk4"": ""对每个菜单的最大自定义"",
+""m_logs"": ""打开日志文件夹"",
+""n_dl_done"": ""下载完成：{0}"",
+""n_tray"": ""Safoude 仍在托盘中运行。"",
+""close_tray"": ""关闭窗口时隐藏到托盘"",
+""logs_on"": ""写入日志文件"",
+""logs_dir"": ""日志文件夹"",
+""dl_col_file"": ""文件"",
+""dl_col_status"": ""状态"",
+""dl_col_size"": ""大小"",
+""grp_behavior"": ""行为"",
+""grp_region"": ""语言和地区""
 }
 }";
     }
